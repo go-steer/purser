@@ -21,3 +21,5 @@
 // link a server's verification machinery. See README.md for the layout and
 // core-agent's docs/purser-auth-design.md for the design.
 package purser
+
+// review-gate verification; branch is throwaway.
