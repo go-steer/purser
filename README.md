@@ -9,9 +9,10 @@ turn a TLS connection or an HTTP request into a `Caller`, and answer whether
 that caller may perform an action.
 
 > **Status: phase 1a, in progress.** The identity contract, the test harness,
-> the bearer-token table, and the standard-CA mTLS profile are in place. The
-> SPIFFE profile and OIDC are next, and nothing here is importable as a stable
-> API until phase 1a is complete.
+> the bearer-token table, and both mTLS profiles — standard-CA and SPIFFE — are
+> in place. OIDC, the authorization layer, the HTTP middleware, and the client
+> helpers are next, and nothing here is importable as a stable API until phase
+> 1a is complete.
 
 ## Why it exists
 
@@ -46,7 +47,7 @@ package buried in a daemon.
 | `purser` | `Caller`, `AuthSource`, the sentinel errors, and the context plumbing. Stdlib-only and depends on no other purser package, so a client that merely reads an identity off a context links nothing else. |
 | `authn` | The `Authenticator` contract and its implementations. Each credential type lands in its own subpackage. |
 | `authn/bearer` | The static token table, kept for compatibility with deployments running one today. It is the thing purser exists to replace, not the thing to reach for in a new deployment. |
-| `authn/mtls` | Caller identity from a client certificate. Each profile's constructor returns a `*tls.Config` and the `Authenticator` that understands the connections it admits, together — the two are one decision, and the PKI and SPIFFE profiles verify with opposite `crypto/tls` idioms. |
+| `authn/mtls` | Caller identity from a client certificate, in two profiles: `NewPKI` for certificates from a standard CA, `NewSPIFFE` for X.509-SVIDs. Each constructor returns a `*tls.Config` and the `Authenticator` that understands the connections it admits, together — the two are one decision, and the profiles verify with opposite `crypto/tls` idioms. Also the connection-admission matchers for both, anchored so that a rule naming one namespace cannot be widened into one naming several. |
 | `authtest` | An in-memory CA and `RunAuthenticatorSuite`, the conformance suite every `Authenticator` — here and in consuming repos — is expected to pass. |
 
 ## Design

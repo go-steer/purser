@@ -75,6 +75,37 @@ in [`CONTRIBUTING.md`](./CONTRIBUTING.md).
   matcher installed there would stop applying as soon as a client reconnected
   with a ticket.
 
+- `authn/mtls`: the SPIFFE profile — `NewSPIFFE` returns the same matched pair
+  for X.509-SVIDs, taking an `x509svid.Source` for the server's own SVID and an
+  `x509bundle.Source` for the trust anchors, both read per handshake so SVID
+  rotation and bundle withdrawal need no restart. `Caller.Identity` is the full
+  `spiffe://…` ID and `Caller.Labels` add `spiffe.trust_domain` and
+  `spiffe.path` alongside the same `cert.*` audit trio the PKI profile sets.
+  It deliberately does **not** use go-spiffe's `MTLSServerConfig`: that helper
+  verifies in `VerifyPeerCertificate`, which crypto/tls skips on a resumed
+  session, and under `RequireAnyClientCert` there is no `ClientCAs` re-check to
+  fall back on — so an expired SVID or a withdrawn authority would keep working
+  for the life of a session ticket. purser verifies in `VerifyConnection`
+  instead, with go-spiffe's own `x509svid.Verify` doing the work. A test pins
+  the upstream gap so this can be revisited if it closes.
+- `authn/mtls`: `SPIFFEAuth.Authenticate` re-verifies the peer's certificates
+  against the trust bundle on every request rather than trusting the handshake.
+  The SPIFFE profile leaves `VerifiedChains` empty by design, so unlike the PKI
+  profile there is no verified-state flag to read; re-verifying is what makes a
+  mispaired config fail closed, and it lets bundle rotation and SVID expiry take
+  effect on the next request rather than the next handshake — which on a
+  long-lived streaming connection may be hours away.
+- `authn/mtls`: SPIFFE admission matchers — `MatchPathSegments`,
+  `MatchPathPrefix`, `MatchGKEWorkload`, composed with `MatchAll` /
+  `MatchAnyOf`. They are `spiffeid.Matcher` values, so they compose with
+  go-spiffe's `MatchID`, `MatchOneOf`, and `MatchMemberOf` rather than
+  re-exporting them. Path segments are passed variadically and validated
+  individually, so a segment interpolated from configuration cannot smuggle a
+  separator in and widen the rule, and the prefix matcher is anchored on a
+  segment boundary — `MatchPathPrefix("ns", "prod")` does not admit
+  `/ns/production`. An empty or invalid segment list, or an unset
+  `MatchGKEWorkload` argument, admits nobody.
+
 ### Added (scaffold)
 - Initial scaffold: empty `github.com/go-steer/purser` module, Apache 2.0
   license, and `doc.go`.
