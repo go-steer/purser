@@ -137,11 +137,11 @@ most important thing in this design.
 
 | | **PKI profile** (standard CA) | **SPIFFE profile** (go-spiffe) |
 |---|---|---|
-| `tls.Config` from | stdlib, `ClientCAs` pool | `tlsconfig.MTLSServerConfig(svid, bundle, authorizer)` |
+| `tls.Config` from | stdlib, `ClientCAs` pool | stdlib + `tlsconfig.GetCertificate(svid)`, see below |
 | `ClientAuth` | `RequireAndVerifyClientCert` | `RequireAnyClientCert` |
-| Who verifies | Go's TLS stack | go-spiffe's `VerifyPeerCertificate` → `x509svid.ParseAndVerify` |
+| Who verifies | Go's TLS stack | `x509svid.Verify` against the bundle, from `VerifyConnection` |
 | `r.TLS.VerifiedChains` | **populated** | **empty** |
-| Read identity from | `VerifiedChains[0][0]` | `PeerCertificates[0]` |
+| Read identity from | `VerifiedChains[0][0]` | `PeerCertificates`, re-verified |
 | Identity field | configured: SAN email / URI / DNS / CN / DN | URI SAN via `x509svid.IDFromCert` |
 | Trust refresh | static CA file (+ optional CRL) | `workloadapi.X509Source`, auto-rotating |
 | Revocation | CRL / OCSP (Go does neither automatically) | short-lived, rotating SVIDs |
@@ -155,6 +155,20 @@ that discards Go's computed chains entirely and calls
 `VerifiedChains` is empty on an accepted SPIFFE connection, and why
 reading `PeerCertificates[0]` is the *correct* move there while being an
 authentication bypass anywhere else.
+
+**purser does not use that hook.** `NewSPIFFE` builds the config itself —
+`RequireAnyClientCert`, `tlsconfig.GetCertificate(svid)` to present the
+server's own SVID, and `x509svid.Verify` plus the authorizer inside
+`VerifyConnection` — because `VerifyPeerCertificate` is not called on a
+resumed session (see "admission runs in `VerifyConnection`" below), and
+under `RequireAnyClientCert` there is no `ClientCAs` pool for crypto/tls
+to fall back on either. A server built on the upstream helper therefore
+verifies the peer's SVID on the first handshake and on no handshake
+after it, for the lifetime of the ticket. Verification is go-spiffe's
+code either way; only the hook it hangs from is purser's, and there is
+exactly one of them.
+`authn/mtls/spiffe_test.go` pins the gap against go-spiffe itself, so if
+upstream closes it the test fails and the deviation can be revisited.
 
 ### The API consequence: config and authenticator are a matched pair
 
@@ -185,6 +199,19 @@ no verify callback, `PeerCertificates[0]` is attacker-chosen. purser
 therefore refuses a caller-supplied `tls.Config` on either profile. The
 middleware still defends in depth: no peer certificate means anonymous,
 never a guess.
+
+The two profiles fail differently when that pairing is broken anyway,
+and only one of them can detect it. A `PKIAuth` on a config that does
+not verify finds `VerifiedChains` empty and 401s. A `SPIFFEAuth` has no
+such signal — `VerifiedChains` is empty on a *good* SPIFFE connection —
+so it re-runs `x509svid.Verify` against its own bundle on every request
+rather than infer that the handshake did. That costs a chain
+verification per request and buys a Layer B that is safe on its own
+terms; it also means a withdrawn trust anchor or an expired SVID takes
+effect on the next request rather than the next handshake, which on a
+long-lived SSE stream may be hours away. `SPIFFEOptions.Admit` is *not*
+re-applied there: admission is a decision about a connection, and
+per-request policy is `authz`'s.
 
 ### Layer A and Layer B must not be conflated
 
@@ -328,14 +355,24 @@ is refused outright.
 
 ### `authn/mtls` — SPIFFE profile
 
-**Identity extraction** uses
-`x509svid.IDFromCert(cert) (spiffeid.ID, error)` rather than
-hand-rolled URI SAN parsing. It already enforces exactly-one-URI-SAN and
-valid SPIFFE syntax — the two cases a hand-rolled parser gets wrong.
+**Identity extraction** is a side effect of verification:
+`x509svid.Verify(certs, bundle)` returns the `spiffeid.ID` along with
+the chains it built, so purser never parses a URI SAN itself and never
+reads an ID off a certificate it has not verified. go-spiffe already
+enforces exactly-one-URI-SAN, valid SPIFFE syntax, and a non-CA leaf —
+the cases a hand-rolled parser gets wrong. The leaf whose issuer and
+serial land in the audit labels is `chains[0][0]`, the verified one,
+not whatever the peer happened to send first.
 
 **`Caller` mapping:** `Identity` is the full `spiffe://…` string;
 `Labels` carry `spiffe.trust_domain` (`id.TrustDomain()`) and
-`spiffe.path` (`id.Path()`).
+`spiffe.path` (`id.Path()`), plus the same `cert.issuer_dn` /
+`cert.serial` / `cert.not_after` audit trio the PKI profile sets, so one
+audit consumer reads both profiles.
+
+**A zero `SPIFFEAuth` rejects everything.** The bundle source it holds
+is also the marker that it came from `NewSPIFFE`; a value built any
+other way has no trust anchors and no business resolving an identity.
 
 **SVID and bundle sources**, both satisfying `x509svid.Source` and
 `x509bundle.Source`:
@@ -346,10 +383,24 @@ valid SPIFFE syntax — the two cases a hand-rolled parser gets wrong.
 - Static PEM via `x509bundle.FromX509Authorities(td, certs)` — for
   development and no-SPIRE deployments.
 
-go-spiffe v2.6.0 is already a transitive dependency of k8s-lookout, so
-it adds no new supply-chain surface there.
+Both are read on every handshake and every request rather than
+snapshotted at construction, which is what makes rotation and
+withdrawal take effect without a restart.
 
-### `authn/mtls/match.go` — admission matchers
+go-spiffe v2.6.0 is already a transitive dependency of k8s-lookout, so
+it adds no new supply-chain surface there. Within purser it adds none at
+all beyond itself: the four packages used (`spiffeid`, `x509bundle`,
+`svid/x509svid`, `spiffetls/tlsconfig`) need only the standard library,
+so `go.mod` gains one direct requirement and no indirect ones. The gRPC
+and go-jose dependencies live in `workloadapi`, which purser does not
+import — a consumer that wants the SPIRE agent socket takes them on
+knowingly.
+
+### `authn/mtls` — admission matchers
+
+Two files, one per profile: `match.go` for the PKI profile's
+`CertMatcher`, `spiffematch.go` for the SPIFFE profile's
+`spiffeid.Matcher`.
 
 **SPIFFE.** go-spiffe's `Authorizer` is a **function type** —
 [`type Authorizer func(id spiffeid.ID, verifiedChains [][]*x509.Certificate) error`](https://github.com/spiffe/go-spiffe/blob/v2.6.0/spiffetls/tlsconfig/authorizer.go#L12)
@@ -370,33 +421,56 @@ strings.Contains(id.Path(), "/ns/prod/")
 // also matches spiffe://td/ns/attacker/x/ns/prod/sa/y
 ```
 
-purser ships structured matchers that cannot be fooled this way,
-composable via `MatchAll` / `MatchAnyOf`:
+purser ships structured matchers that cannot be fooled this way:
 
 | Matcher | Use |
 |---|---|
-| `MatchID` / `MatchOneOf` (re-exported) | Deterministic pin to an exact workload |
-| `MatchMemberOf` (re-exported) | Trust-domain membership |
 | `MatchPathSegments("ns", ns, "sa", sa)` | Structured segment equality — no substring escape |
 | `MatchPathPrefix(segments...)` | Anchored, segment-aligned prefix |
-| `MatchPathPattern("/ns/*/sa/deployer")` | Glob over whole segments |
+| `MatchAll(matchers...)` | Conjunction; empty adds no constraint |
+| `MatchAnyOf(matchers...)` | Disjunction; empty admits nobody |
 
-Plus GCP-shaped wrappers, since both target topologies are Google:
+They *are* `spiffeid.Matcher` values rather than a parallel type, so
+go-spiffe's four built-ins need no re-export: `MatchAll(
+spiffeid.MatchMemberOf(td), MatchPathSegments("ns", ns, "sa", sa))`
+composes across both packages, and anything that takes a
+`spiffeid.Matcher` takes purser's.
+
+Segments are variadic arguments rather than one `"/ns/prod/sa/api"`
+string, which is what makes the anchoring hold when a segment comes from
+configuration: a value carrying a slash is rejected by
+`spiffeid.ValidatePathSegment` instead of silently widening the rule.
+An empty or invalid segment list yields a matcher that admits nobody, so
+a rule assembled from unset configuration closes the door.
+
+There is deliberately **no glob matcher**. A pattern language is the
+same anchoring hazard one layer up — `/ns/*/sa/deployer` invites
+`/ns/*` — and nothing in the target deployments needs it that
+`MatchAnyOf` over explicit alternatives does not cover. It can be added
+if a real consumer wants it; it cannot be removed once shipped.
+
+Plus a GCP-shaped wrapper, since the target topology is Google:
 
 - **GKE workload identity** —
   `spiffe://{project}.svc.id.goog/ns/{ns}/sa/{sa}`:
-  `MatchGKEWorkload(project, ns, sa)`, with `""` meaning "any".
-- **Vertex Agent Engine** —
-  `spiffe://agents.global.org-{org}.system.id.goog/resources/aiplatform/projects/{proj}/locations/{loc}/reasoningEngines/{id}`:
-  `MatchAgentEngine(org, proj, loc, engineID)`, same wildcarding.
+  `MatchGKEWorkload(project, ns, sa)`. An empty or malformed argument
+  admits nobody; there is no `""`-means-any wildcard, because the
+  argument most likely to be accidentally empty is the one read from
+  configuration. `MatchAll(spiffeid.MatchMemberOf(td),
+  MatchPathPrefix("ns", ns))` is the way to say "any workload in this
+  namespace".
 
-The Google trust-domain shapes differ from each other
-(`agents.global.org-{org}`, `agents.global.proj-{proj}`,
-`{project}.svc.id.goog`). The helpers pin each shape and are
-table-tested against real example IDs rather than assembled ad hoc at
-each call site, because a subtly wrong trust domain is a silent
-authorization bypass. Combining trust-domain and path checks is
-`MatchAll(MatchMemberOf(td), MatchPathSegments(...))`.
+The helper exists because the trust domain is the *project*, not the
+cluster — a shape that is easy to assemble wrongly by hand, and a subtly
+wrong trust domain is a silent authorization bypass.
+
+A **Vertex Agent Engine** wrapper is deferred. Its trust domain and
+resource path
+(`agents.global.org-{org}` versus `agents.global.proj-{proj}`, and the
+`/resources/aiplatform/projects/…/reasoningEngines/…` path) could not be
+confirmed against a real issued SVID, and a matcher pinned to a guessed
+shape is worse than no matcher: it fails closed in testing and stays
+wrong in production. `MatchPathSegments` expresses it in the meantime.
 
 **PKI.** The standard library has no `Authorizer` equivalent, so purser
 supplies the same Layer-A concept over the parsed peer certificate as
@@ -526,8 +600,9 @@ for a floor to mean anything.
 
 Keep the root package, `authz`, `httpmw`, and the PKI half of
 `authn/mtls` **stdlib-only**. go-spiffe, the JWT/JWKS library, and
-oauth2 + idtoken are confined to `authn/mtls/spiffe.go`, `authn/oidc`,
-and `client/google.go` respectively. If import-graph isolation turns out
+oauth2 + idtoken are confined to `authn/mtls/spiffe.go` +
+`authn/mtls/spiffematch.go`, `authn/oidc`, and `client/google.go`
+respectively. If import-graph isolation turns out
 to matter more than ergonomics, those can become nested modules — a
 decision to make on a real consumer complaint, not upfront.
 

@@ -27,16 +27,18 @@
 //   - PKI sets ClientAuth to RequireAndVerifyClientCert with a
 //     ClientCAs pool. crypto/tls builds the chain, so the verified leaf
 //     is VerifiedChains[0][0].
-//   - SPIFFE (in a later change) delegates verification to go-spiffe,
-//     which sets RequireAnyClientCert and verifies inside
-//     VerifyPeerCertificate. VerifiedChains is *empty* and the leaf is
-//     PeerCertificates[0].
+//   - SPIFFE sets RequireAnyClientCert and verifies with go-spiffe,
+//     against a trust bundle keyed by the peer's own trust domain.
+//     crypto/tls's chain builder never runs, so VerifiedChains is
+//     *empty* and the certificates are in PeerCertificates.
 //
 // Reading the wrong one is not a cosmetic mistake. PeerCertificates
 // holds whatever the peer sent, verified or not; a PKI authenticator
 // that read it — or that fell back to it when VerifiedChains was empty
 // — would accept a self-signed certificate carrying any identity the
-// attacker chose. This package never falls back.
+// attacker chose. This package never falls back. The SPIFFE
+// authenticator, which has no VerifiedChains to read, re-verifies the
+// certificates itself rather than assume the handshake did.
 //
 // # Matched pairs
 //
@@ -50,9 +52,11 @@
 // # Admission and identity are separate
 //
 // Layer A — connection admission — decides whether a peer may open a
-// connection at all: chain verification, plus the optional CertMatcher
-// in PKIOptions.Admit. It runs during the handshake, and a rejected
-// peer never reaches an HTTP handler.
+// connection at all: chain verification, plus the optional matcher in
+// PKIOptions.Admit or SPIFFEOptions.Admit. It runs during the
+// handshake, and a rejected peer never reaches an HTTP handler. Both
+// profiles enforce it from tls.Config.VerifyConnection, the one hook
+// crypto/tls calls on resumed handshakes as well as full ones.
 //
 // Layer B — identity extraction — runs per request and is
 // unconditional. Whatever Layer A decided, the caller's identity is
