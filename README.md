@@ -8,8 +8,10 @@ A purser is the officer who checks who is aboard. That is the whole job here —
 turn a TLS connection or an HTTP request into a `Caller`, and answer whether
 that caller may perform an action.
 
-> **Status: scaffold.** No API yet. This repo currently holds the module,
-> the license, and the CI guardrails; the library lands in phase 1a.
+> **Status: phase 1a, in progress.** The identity contract and the test
+> harness are in place. No authenticator that verifies a credential has landed
+> yet — bearer, mTLS, and OIDC are next, and nothing here is importable as a
+> stable API until phase 1a is complete.
 
 ## Why it exists
 
@@ -36,6 +38,14 @@ package buried in a daemon.
 | [`core-tui`](https://github.com/go-steer/core-tui) | client |
 | [`switchboard`](https://github.com/go-steer/switchboard) | client |
 | [`k8s-lookout`](https://github.com/go-steer/k8s-lookout) | server |
+
+## Packages
+
+| Package | Contents |
+|---|---|
+| `purser` | `Caller`, `AuthSource`, the sentinel errors, and the context plumbing. Stdlib-only and depends on no other purser package, so a client that merely reads an identity off a context links nothing else. |
+| `authn` | The `Authenticator` contract and its implementations. Each credential type lands in its own subpackage. |
+| `authtest` | An in-memory CA and `RunAuthenticatorSuite`, the conformance suite every `Authenticator` — here and in consuming repos — is expected to pass. |
 
 ## Design
 
