@@ -64,3 +64,5 @@ See [`dev/README.md`](./dev/README.md) for the tooling layout and
 ## License
 
 Apache 2.0 — see [LICENSE](./LICENSE).
+
+<!-- review-gate verification; branch is throwaway -->
