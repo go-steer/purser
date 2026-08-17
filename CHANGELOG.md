@@ -50,6 +50,31 @@ in [`CONTRIBUTING.md`](./CONTRIBUTING.md).
   on a file holding zero rows (`ErrNoUsers`); `New` tolerates an empty table,
   which is legitimate when a second authenticator supplements it.
 
+- `authn/mtls`: the PKI profile — `NewPKI` returns a server `*tls.Config`
+  requiring a verified client certificate *and* the `*PKIAuth` that reads an
+  identity from it, as a matched pair. It is one decision: the config's
+  `ClientAuth` mode determines where the verified certificate can be found, and
+  the authenticator reads exactly that place, never `PeerCertificates`, which
+  holds whatever the peer sent. The identity field is configured explicitly
+  (`san_email`, `san_uri`, `san_dns`, `subject_cn`, `subject_dn`) with no
+  fallback chain, and a field carrying zero or several values is rejected
+  rather than guessed at. `Caller.Labels` carry `cert.issuer_dn`,
+  `cert.serial`, and `cert.not_after` for audit. The TLS floor defaults to
+  **1.3** — core-agent's server sets 1.2, and a deployment that needs 1.2 now
+  asks for it explicitly.
+- `authn/mtls`: `CertMatcher` and its combinators, the connection-admission
+  (Layer A) check applied to the verified leaf during the handshake:
+  `MatchCertIssuerDN`, `MatchCertOrganization`, `MatchCertOrganizationalUnit`,
+  `MatchCertEmailSAN`, `MatchCertEmailDomain`, `MatchCertDNSSAN`,
+  `MatchCertDNSSuffix`, `MatchCertFunc`, composed with `MatchCertAll` /
+  `MatchCertAnyOf`. The domain matchers are anchored — on the last `@` and on a
+  label boundary respectively — because a plain suffix test admits
+  `alice@notexample.com` and `evil-svc.cluster.local`. Admission is enforced in
+  `tls.Config.VerifyConnection` rather than the more obvious
+  `VerifyPeerCertificate`, which crypto/tls skips on a resumed session — a
+  matcher installed there would stop applying as soon as a client reconnected
+  with a ticket.
+
 ### Added (scaffold)
 - Initial scaffold: empty `github.com/go-steer/purser` module, Apache 2.0
   license, and `doc.go`.

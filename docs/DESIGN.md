@@ -166,8 +166,17 @@ library constructs both halves together and binds them:
 // The Authenticator knows which profile its tls.Config enforces,
 // so it reads the correct field. You cannot obtain one without
 // the other.
-tlsCfg, authn, err := mtls.New(mtls.Options{Profile: mtls.SPIFFE, ...})
+tlsCfg, auth, err := mtls.NewPKI(mtls.PKIOptions{...})
+tlsCfg, auth, err := mtls.NewSPIFFE(mtls.SPIFFEOptions{...})
 ```
+
+**One constructor per profile, not one with a `Profile` switch.** The
+options are disjoint — `ClientCAs` and `Subject` mean nothing to SPIFFE,
+an `x509svid.Source` means nothing to PKI — and a single struct holding
+both makes "set the wrong profile's field" a compile-clean way to end up
+with a listener verifying something other than what the operator
+configured. Separate constructors turn that into an unused field the
+reader can see, and let each one reject its own options completely.
 
 This makes the dangerous case structurally unreachable. Reading
 `PeerCertificates[0]` is safe *only* because the paired config
@@ -233,9 +242,9 @@ purser/
     authn.go                 Authenticator, AuthenticatorWithProxy, CredentialGate
     bearer/                  BearerTokenAuth + users.json loader (DEPRECATED)
     mtls/
-      mtls.go                New() -> (*tls.Config, Authenticator)
-      pkix.go                standard-CA profile (stdlib only)
-      spiffe.go              SPIFFE profile (go-spiffe)
+      mtls.go                shared labels, TLS floor, connection state
+      pkix.go                NewPKI() -> (*tls.Config, *PKIAuth) (stdlib only)
+      spiffe.go              NewSPIFFE() -> (*tls.Config, *SPIFFEAuth)
       match.go               admission matchers, both profiles
     oidc/                    issuer + JWKS + claim mapping -> Caller
   authz/
@@ -297,7 +306,25 @@ configured source; a certificate that doesn't carry it is rejected.
 - `subject_cn` — legacy; supported, documented as discouraged
 - `subject_dn` — full RFC 2253 string, when the whole DN is the identity
 
-`Caller.Labels` carry the issuer DN, serial, and `NotAfter` for audit.
+A field carrying **more than one** value is rejected too, not resolved
+by taking the first: two email SANs are two identities, and which one a
+request is attributed to must not depend on the order the CA encoded
+them in. A multi-name service certificate — the usual Kubernetes shape —
+wants `san_uri` or the SPIFFE profile, where the identity is singular by
+construction.
+
+`Caller.Labels` carry the issuer DN, serial, and `NotAfter` for audit
+(`cert.issuer_dn`, `cert.serial`, `cert.not_after`). Issuer plus serial
+is what a revocation list is keyed by, and the pair an audit record
+needs to trace a request back to an issued credential.
+
+**The TLS floor defaults to 1.3, not 1.2.** core-agent's
+[`LoadTLSConfig`](https://github.com/go-steer/core-agent/blob/09b6cd1d9c97fa1e2673bac2e664d97579c68b24/pkg/attach/auth.go#L61)
+sets 1.2; purser raises the default because every first-party client
+speaks 1.3, and a deployment that genuinely needs 1.2 can ask for it
+through `MinVersion`. That is the direction the mistake should point: an
+operator who says nothing gets the stronger setting. Anything below 1.2
+is refused outright.
 
 ### `authn/mtls` — SPIFFE profile
 
@@ -372,12 +399,40 @@ authorization bypass. Combining trust-domain and path checks is
 `MatchAll(MatchMemberOf(td), MatchPathSegments(...))`.
 
 **PKI.** The standard library has no `Authorizer` equivalent, so purser
-supplies the same Layer-A concept over the parsed peer certificate:
-match on issuer DN, SAN pattern, OU membership, or a caller-supplied
-predicate, enforced inside `VerifyPeerCertificate` (which Go invokes
-*after* successful chain verification, with `verifiedChains`
-populated). Same composition vocabulary as the SPIFFE side, so operators
-learn one model.
+supplies the same Layer-A concept over the parsed peer certificate as
+`CertMatcher` (`func(*x509.Certificate) error`). Same composition
+vocabulary as the SPIFFE side, so operators learn one model.
+
+It is enforced inside **`VerifyConnection`, not `VerifyPeerCertificate`**
+— the hook that looks right and is wrong. `VerifyPeerCertificate` is
+skipped entirely when a session resumes from a ticket: crypto/tls
+re-checks the carried chain against `ClientCAs`, rejects an expired leaf
+([`handshake_server_tls13.go`](https://github.com/golang/go/blob/go1.26.6/src/crypto/tls/handshake_server_tls13.go#L370-L381)),
+restores `VerifiedChains`, and proceeds. An admission matcher hung there
+stops applying the moment a client reconnects with a ticket, so a peer
+admitted under an older policy keeps its access for the ticket's
+lifetime. `VerifyConnection` runs on both the full and resumed paths, on
+TLS 1.2 and 1.3, with the same verified state.
+
+| Matcher | Use |
+|---|---|
+| `MatchCertIssuerDN(dn)` | Which authority in a multi-CA pool vouched |
+| `MatchCertOrganization(o)` / `MatchCertOrganizationalUnit(ou)` | Subject RDN membership |
+| `MatchCertEmailSAN(email)` / `MatchCertDNSSAN(name)` | Exact SAN pin |
+| `MatchCertEmailDomain(domain)` | Anchored on the last `@` |
+| `MatchCertDNSSuffix(domain)` | Anchored on a label boundary |
+| `MatchCertFunc(fn)` | Anything else |
+
+The two domain matchers are anchored for the same reason the SPIFFE path
+matchers are: `strings.HasSuffix(email, "example.com")` also admits
+`alice@notexample.com`, and `HasSuffix(name, "svc.cluster.local")` also
+admits `evil-svc.cluster.local`. Both are a domain registration away
+from being an authorization bypass.
+
+`MatchCertAll` and `MatchCertAnyOf` compose them, and their empty cases
+are deliberate opposites: an empty conjunction adds no constraint, while
+an empty disjunction admits nobody. That is what keeps "unconstrained"
+from being spelled the same way as "the allowlist came back empty".
 
 ### `authn/oidc`
 
