@@ -37,6 +37,19 @@ in [`CONTRIBUTING.md`](./CONTRIBUTING.md).
   tests run each check against a deliberately broken authenticator and assert
   the failure is reported.
 
+- `authn/bearer`: the static token table, ported from core-agent's `pkg/auth`
+  so phase 2 is a no-op for deployments running one today. Same `users.json`
+  schema (version 1) and the same 0600-or-stricter permission requirement, with
+  three corrections: the table is keyed by a SHA-256 digest rather than
+  compared token by token, `LookupIdentity` clones the Caller it hands out
+  (core-agent's returns the table's own `Labels` map), and the `Authorization`
+  scheme is matched case-insensitively per RFC 7235 §2.1. Loading also rejects
+  a token carrying leading or trailing whitespace — the header parser strips
+  it, so such a row could never be presented and the operator would see a user
+  who silently cannot log in. `NewFromFile` fails
+  on a file holding zero rows (`ErrNoUsers`); `New` tolerates an empty table,
+  which is legitimate when a second authenticator supplements it.
+
 ### Added (scaffold)
 - Initial scaffold: empty `github.com/go-steer/purser` module, Apache 2.0
   license, and `doc.go`.
