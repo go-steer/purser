@@ -19,5 +19,5 @@
 // The root package deliberately exports nothing. The API lives in
 // subpackages, so that a consumer that only needs a client dialer does not
 // link a server's verification machinery. See README.md for the layout and
-// core-agent's docs/purser-auth-design.md for the design.
+// docs/DESIGN.md for the design.
 package purser
