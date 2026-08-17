@@ -4,11 +4,11 @@ Instructions for AI agents working in this repository.
 
 ## Start here
 
-[`README.md`](./README.md) for what purser is, and core-agent's
-[`docs/purser-auth-design.md`](https://github.com/go-steer/core-agent/blob/main/docs/purser-auth-design.md)
-for the design this module implements — the two mTLS profiles, the separation
-of connection admission from identity extraction, and the phase plan. Read the
-design before adding to the exported surface.
+[`README.md`](./README.md) for what purser is, and
+[`docs/DESIGN.md`](./docs/DESIGN.md) for the design this module implements —
+the two mTLS profiles, the separation of connection admission from identity
+extraction, and the phase plan. Read the design before adding to the exported
+surface, and keep it current in the same PR as the API change it describes.
 
 ## What this project is
 

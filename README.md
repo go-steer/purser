@@ -39,9 +39,9 @@ package buried in a daemon.
 
 ## Design
 
-The design lives with the service that motivated it:
-[`core-agent/docs/purser-auth-design.md`](https://github.com/go-steer/core-agent/blob/main/docs/purser-auth-design.md).
-Read it before adding to the API surface. In short:
+[`docs/DESIGN.md`](./docs/DESIGN.md) is the design of record — the phase plan,
+the decisions and why they went that way, and the properties the tests exist to
+pin. Read it before adding to the API surface. In short:
 
 - Two mTLS profiles — standard PKI and SPIFFE — verified with opposite
   `crypto/tls` idioms, behind one matched-pair constructor that returns a

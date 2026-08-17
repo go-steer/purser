@@ -23,3 +23,6 @@ in [`CONTRIBUTING.md`](./CONTRIBUTING.md).
 - `dev/tools/verify-apidiff` + `dev/api-breaks.txt`: the exported surface is
   the product, so every change to it is reported against the last release tag
   and incompatible ones fail unless acknowledged in the same PR.
+- `docs/DESIGN.md`: the design of record — motivation, the two mTLS profiles
+  and why they verify with opposite `crypto/tls` idioms, the admission /
+  identity split, the phase plan, and the verification each phase owes.
