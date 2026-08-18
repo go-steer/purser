@@ -12,15 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# The same server as examples/k8s/spiffe, with the sidecar deleted.
+# The same server as examples/k8s/spiffe, deployed differently.
 #
-# That is the whole difference. GKE's managed workload identity mounts
-# the SVID, its key and the trust anchors directly, under the same three
-# file names spiffe-helper was configured to write, so the container
-# arguments differ only in the trust domain. Reading credentials from
-# files rather than from an agent socket is what makes that true — and
-# it has to be true here, because managed workload identity publishes no
-# Workload API socket to talk to.
+# GKE's managed workload identity mounts the SVID, its key and the trust
+# anchors directly, under the same three file names spiffe-helper was
+# configured to write, so the Go code does not change at all. What
+# changes is around it: the sidecar and the SPIRE agent socket are gone,
+# the emptyDir becomes a podcertificate.gke.io CSI volume, the trust
+# domain is the fleet's, the admitted peer is named with
+# -spiffe-admit-gke, and Standard clusters need a nodeSelector.
+#
+# Reading credentials from files rather than from an agent socket is
+# what keeps the code identical — and it has to be, because managed
+# workload identity publishes no Workload API socket to talk to.
 #
 # Replace the image with one you have pushed. See README.md.
 

@@ -22,6 +22,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -90,17 +91,33 @@ func mintSPIFFE(t *testing.T) credentials.Set {
 	return set
 }
 
+// counts is how the rejection tests tell the two layers apart.
+//
+// Reading only reached would not: hello.Authenticate answers 401
+// without calling the handler when identity extraction fails, so
+// reached == 0 is satisfied by a Layer B rejection as well as by a
+// Layer A one — and an implementation that moved admission out of the
+// handshake into a per-request check, the exact regression these tests
+// are named for, would keep every assertion green.
+type counts struct {
+	// handshakes counts connections that completed the TLS handshake
+	// and began a request. Layer A rejects strictly before this: a peer
+	// the admission matcher turns away never reaches http.StateActive.
+	handshakes atomic.Int64
+
+	// reached counts requests that got past the authenticator into the
+	// handler.
+	reached atomic.Int64
+}
+
 // serve starts the example service on a loopback port and returns its
-// base URL plus a counter of how many requests reached the handler. The
-// counter is what distinguishes a connection refused at the handshake
-// from one refused at the door: an admission matcher must reject before
-// a handler ever runs.
-func serve(t *testing.T, cfg *tls.Config, auth authn.Authenticator) (string, *atomic.Int64) {
+// base URL plus the two counters.
+func serve(t *testing.T, cfg *tls.Config, auth authn.Authenticator) (string, *counts) {
 	t.Helper()
 
-	var reached atomic.Int64
+	var c counts
 	count := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		reached.Add(1)
+		c.reached.Add(1)
 		hello.Handler("test-server", discardLogger()).ServeHTTP(w, r)
 	})
 
@@ -118,11 +135,20 @@ func serve(t *testing.T, cfg *tls.Config, auth authn.Authenticator) (string, *at
 		// crypto/tls logs every failed handshake through here, and the
 		// rejection tests cause plenty on purpose.
 		ErrorLog: slog.NewLogLogger(discardLogger().Handler(), slog.LevelDebug),
+		// StateNew fires on accept, before the handshake; StateActive
+		// fires only once net/http has read the first byte of a request
+		// off the decrypted stream. So this counts handshakes that
+		// succeeded, and nothing else.
+		ConnState: func(_ net.Conn, state http.ConnState) {
+			if state == http.StateActive {
+				c.handshakes.Add(1)
+			}
+		},
 	}
 	go func() { _ = srv.ServeTLS(ln, "", "") }()
 	t.Cleanup(func() { _ = srv.Close() })
 
-	return "https://" + ln.Addr().String(), &reached
+	return "https://" + ln.Addr().String(), &c
 }
 
 func greet(t *testing.T, cfg *tls.Config, url string) (hello.Greeting, error) {
@@ -163,7 +189,7 @@ func TestPKIRoundTrip(t *testing.T) {
 	set := mintPKI(t)
 
 	cfg, auth := serverFor(t, append(pkiArgs(set.Server.Dir), "-pki-admit-ou", "platform")...)
-	url, reached := serve(t, cfg, auth)
+	url, c := serve(t, cfg, auth)
 
 	g, err := greet(t, clientFor(t, pkiArgs(set.Client.Dir)...), url)
 	if err != nil {
@@ -175,11 +201,14 @@ func TestPKIRoundTrip(t *testing.T) {
 	if g.AuthSource != "mtls" {
 		t.Errorf("auth source = %q, want mtls", g.AuthSource)
 	}
-	if reached.Load() != 1 {
-		t.Errorf("handler ran %d times, want 1", reached.Load())
+	if c.reached.Load() != 1 {
+		t.Errorf("handler ran %d times, want 1", c.reached.Load())
 	}
-	// HTTP/2, not the 1.1 net/http silently drops to when a caller sets
-	// TLSClientConfig without client.Transport.
+	// Non-vacuity for the rejection tests: this is what a completed
+	// handshake looks like on the counter they assert is zero.
+	if c.handshakes.Load() == 0 {
+		t.Error("no connection reached http.StateActive; the handshake counter is not counting")
+	}
 	if g.Labels == nil {
 		t.Error("no credential labels; the PKI authenticator should attach issuer and serial")
 	}
@@ -192,13 +221,19 @@ func TestPKIAdmitOURejectsAtTheHandshake(t *testing.T) {
 	set := mintPKI(t)
 
 	cfg, auth := serverFor(t, append(pkiArgs(set.Server.Dir), "-pki-admit-ou", "platform")...)
-	url, reached := serve(t, cfg, auth)
+	url, c := serve(t, cfg, auth)
 
 	if _, err := greet(t, clientFor(t, pkiArgs(set.Unauthorized.Dir)...), url); err == nil {
 		t.Fatal("a certificate with the wrong OU was admitted")
 	}
-	if reached.Load() != 0 {
-		t.Errorf("handler ran %d times for a rejected peer, want 0", reached.Load())
+	// Rejected at the handshake, not by a 401: the connection never
+	// carried a request.
+	if c.handshakes.Load() != 0 {
+		t.Errorf("%d connections completed the handshake, want 0 — "+
+			"admission is not being enforced during the handshake", c.handshakes.Load())
+	}
+	if c.reached.Load() != 0 {
+		t.Errorf("handler ran %d times for a rejected peer, want 0", c.reached.Load())
 	}
 }
 
@@ -224,7 +259,7 @@ func TestSPIFFERoundTrip(t *testing.T) {
 	set := mintSPIFFE(t)
 
 	cfg, auth := serverFor(t, append(spiffeArgs(set.Server.Dir), "-spiffe-admit-id", set.Client.Subject)...)
-	url, reached := serve(t, cfg, auth)
+	url, c := serve(t, cfg, auth)
 
 	clientCfg := clientFor(t, append(spiffeArgs(set.Client.Dir), "-spiffe-authorize-id", set.Server.Subject)...)
 	g, err := greet(t, clientCfg, url)
@@ -237,8 +272,11 @@ func TestSPIFFERoundTrip(t *testing.T) {
 	if g.AuthSource != "spiffe" {
 		t.Errorf("auth source = %q, want spiffe", g.AuthSource)
 	}
-	if reached.Load() != 1 {
-		t.Errorf("handler ran %d times, want 1", reached.Load())
+	if c.reached.Load() != 1 {
+		t.Errorf("handler ran %d times, want 1", c.reached.Load())
+	}
+	if c.handshakes.Load() == 0 {
+		t.Error("no connection reached http.StateActive; the handshake counter is not counting")
 	}
 }
 
@@ -246,15 +284,19 @@ func TestSPIFFEAdmitIDRejectsAtTheHandshake(t *testing.T) {
 	set := mintSPIFFE(t)
 
 	cfg, auth := serverFor(t, append(spiffeArgs(set.Server.Dir), "-spiffe-admit-id", set.Client.Subject)...)
-	url, reached := serve(t, cfg, auth)
+	url, c := serve(t, cfg, auth)
 
 	clientCfg := clientFor(t,
 		append(spiffeArgs(set.Unauthorized.Dir), "-spiffe-authorize-id", set.Server.Subject)...)
 	if _, err := greet(t, clientCfg, url); err == nil {
 		t.Fatal("an unnamed SVID was admitted")
 	}
-	if reached.Load() != 0 {
-		t.Errorf("handler ran %d times for a rejected peer, want 0", reached.Load())
+	if c.handshakes.Load() != 0 {
+		t.Errorf("%d connections completed the handshake, want 0 — "+
+			"admission is not being enforced during the handshake", c.handshakes.Load())
+	}
+	if c.reached.Load() != 0 {
+		t.Errorf("handler ran %d times for a rejected peer, want 0", c.reached.Load())
 	}
 }
 
@@ -266,15 +308,20 @@ func TestSPIFFEClientRefusesAnUnauthorizedServer(t *testing.T) {
 	set := mintSPIFFE(t)
 
 	cfg, auth := serverFor(t, spiffeArgs(set.Server.Dir)...)
-	url, reached := serve(t, cfg, auth)
+	url, c := serve(t, cfg, auth)
 
 	clientCfg := clientFor(t,
 		append(spiffeArgs(set.Client.Dir), "-spiffe-authorize-id", set.Unauthorized.Subject)...)
 	if _, err := greet(t, clientCfg, url); err == nil {
 		t.Fatal("the client accepted a server it did not authorize")
 	}
-	if reached.Load() != 0 {
-		t.Errorf("handler ran %d times, want 0", reached.Load())
+	// The client aborts on the server's certificate, so the server never
+	// sees a request — the refusal is the client's, not a 401 it read.
+	if c.handshakes.Load() != 0 {
+		t.Errorf("%d connections completed the handshake, want 0", c.handshakes.Load())
+	}
+	if c.reached.Load() != 0 {
+		t.Errorf("handler ran %d times, want 0", c.reached.Load())
 	}
 }
 
@@ -291,6 +338,108 @@ func TestSPIFFEAdmitsAnyOfSeveralIDs(t *testing.T) {
 	clientCfg := clientFor(t, append(spiffeArgs(set.Client.Dir), "-spiffe-authorize-id", set.Server.Subject)...)
 	if _, err := greet(t, clientCfg, url); err != nil {
 		t.Fatalf("greet: %v", err)
+	}
+}
+
+// copyIdentity copies one minted identity's three PEM files into dst,
+// so a test can rewrite them underneath a running process the way
+// cert-manager rewrites a mounted Secret.
+func copyIdentity(t *testing.T, src, dst string) {
+	t.Helper()
+	for _, name := range []string{credentials.PKICertFile, credentials.PKIKeyFile, credentials.PKICAFile} {
+		b, err := os.ReadFile(filepath.Join(src, name))
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		if err := os.WriteFile(filepath.Join(dst, name), b, 0o600); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+}
+
+// cert-manager renews by rewriting the mounted Secret in place, and
+// nothing restarts the pod. A process that loaded its leaf once serves
+// the old one until it expires — so the example must not load it once.
+func TestPKICertificateIsRereadAfterRotation(t *testing.T) {
+	set := mintPKI(t)
+
+	live := t.TempDir()
+	copyIdentity(t, set.Client.Dir, live)
+
+	cfg, auth := serverFor(t, append(pkiArgs(set.Server.Dir), "-pki-admit-ou", "platform")...)
+	url, c := serve(t, cfg, auth)
+
+	clientCfg := clientFor(t, append(pkiArgs(live), "-pki-reload", "1ms")...)
+	if _, err := greet(t, clientCfg, url); err != nil {
+		t.Fatalf("greet with the platform certificate: %v", err)
+	}
+
+	// Rotate the mount to the identity the server's OU matcher rejects.
+	// If the source were pinned, the client would keep presenting the
+	// old certificate and would still be admitted.
+	copyIdentity(t, set.Unauthorized.Dir, live)
+	time.Sleep(5 * time.Millisecond)
+
+	before := c.handshakes.Load()
+	if _, err := greet(t, clientCfg, url); err == nil {
+		t.Fatal("the rotated-in certificate was admitted; the old one is still being presented")
+	}
+	if got := c.handshakes.Load(); got != before {
+		t.Errorf("%d further connections completed the handshake, want 0", got-before)
+	}
+}
+
+func TestPKICertSourceKeepsTheLastGoodPairOnAFailedReload(t *testing.T) {
+	set := mintPKI(t)
+
+	live := t.TempDir()
+	copyIdentity(t, set.Client.Dir, live)
+
+	src, err := newPKICertSource(
+		filepath.Join(live, credentials.PKICertFile),
+		filepath.Join(live, credentials.PKIKeyFile),
+		time.Millisecond,
+		discardLogger(),
+	)
+	if err != nil {
+		t.Fatalf("newPKICertSource: %v", err)
+	}
+	good := src.get()
+
+	// A half-written file — the state a rotation passes through — must
+	// not take a healthy workload offline.
+	if err := os.WriteFile(filepath.Join(live, credentials.PKICertFile), []byte("-----BEGIN CERT"), 0o600); err != nil {
+		t.Fatalf("truncate certificate: %v", err)
+	}
+	time.Sleep(5 * time.Millisecond)
+
+	if got := src.get(); got != good {
+		t.Error("a failed reload replaced the last good certificate")
+	}
+}
+
+func TestPKICertSourcePinsOnANegativeInterval(t *testing.T) {
+	set := mintPKI(t)
+
+	live := t.TempDir()
+	copyIdentity(t, set.Client.Dir, live)
+
+	src, err := newPKICertSource(
+		filepath.Join(live, credentials.PKICertFile),
+		filepath.Join(live, credentials.PKIKeyFile),
+		-time.Second,
+		discardLogger(),
+	)
+	if err != nil {
+		t.Fatalf("newPKICertSource: %v", err)
+	}
+	pinned := src.get()
+
+	copyIdentity(t, set.Unauthorized.Dir, live)
+	time.Sleep(5 * time.Millisecond)
+
+	if got := src.get(); got != pinned {
+		t.Error("a negative -pki-reload still reloaded")
 	}
 }
 

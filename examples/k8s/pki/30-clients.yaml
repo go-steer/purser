@@ -72,6 +72,10 @@ spec:
             # endpoints are ready. Retry rather than crash-loop.
             - -retries=30
             - -retry-delay=2s
+            # Re-read as cert-manager renews them, on the -pki-reload
+            # interval. Nothing restarts this pod when the Secret
+            # changes, so a process that loaded them once would present
+            # an expired certificate 90 days in.
             - -pki-cert=/etc/purser/tls/tls.crt
             - -pki-key=/etc/purser/tls/tls.key
             # The client verifies the server against the same CA. This
