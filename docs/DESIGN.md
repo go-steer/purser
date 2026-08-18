@@ -5,9 +5,10 @@ module, and for replacing the static bearer-token table with identity
 derived from credentials the infrastructure already issues — SPIFFE
 X509-SVIDs, ordinary CA-issued client certificates, and OIDC tokens.
 
-**Status:** proposed (2026-08-17). No code yet beyond the scaffold. This
-document is purser's design of record; the implementation lands as
-separate PRs across the phases below.
+**Status:** accepted (2026-08-17); phase 1a in progress. This document is
+purser's design of record; the implementation lands as separate PRs
+across the phases below, and any deviation is recorded here in the same
+PR that makes it.
 
 References into core-agent are permalinks pinned to
 [`core-agent@09b6cd1`](https://github.com/go-steer/core-agent/tree/09b6cd1d9c97fa1e2673bac2e664d97579c68b24)
@@ -272,6 +273,7 @@ purser/
       mtls.go                shared labels, TLS floor, connection state
       pkix.go                NewPKI() -> (*tls.Config, *PKIAuth) (stdlib only)
       spiffe.go              NewSPIFFE() -> (*tls.Config, *SPIFFEAuth)
+      spiffefiles.go         SPIFFEFileSource: file-backed, reloading SVID + bundle
       match.go               admission matchers, both profiles
     oidc/                    issuer + JWKS + claim mapping -> Caller
   authz/
@@ -289,7 +291,20 @@ purser/
     conformance.go           suite every Authenticator must pass
     ca.go                    in-memory CA: PKI certs and SPIFFE SVIDs
     issuer.go                fake OIDC issuer (httptest + JWKS)
+  internal/
+    ca/                      the CA core, error-returning; authtest wraps it
+    tlsfloor/                the TLS version floor, shared by client and server
 ```
+
+**Two internal packages exist to stop a policy from being stated
+twice.** `internal/tlsfloor` holds the minimum-version rule, because a
+client and a server that disagree about the floor is a defect nobody
+notices until the weaker one is the one that matters. `internal/ca`
+holds the certificate-minting logic that `authtest` exposes, split out
+because `authtest.CA` takes a `testing.TB` and fails a test on error —
+correct for tests, useless for an example binary or a local development
+command, neither of which should link `testing`. `authtest.CA` is now a
+thin wrapper over it and its public surface is unchanged.
 
 ### Lifted as-is from core-agent
 
@@ -380,12 +395,114 @@ other way has no trust anchors and no business resolving an identity.
 - `workloadapi.NewX509Source(ctx)` — SPIRE agent socket, auto-rotating.
   This is the real answer to revocation: short-lived SVIDs rotated
   in-process.
+- `mtls.NewSPIFFEFileSource(opts)` — credentials delivered as files,
+  reloaded on a ticker. Satisfies both source interfaces from one
+  object. See below.
 - Static PEM via `x509bundle.FromX509Authorities(td, certs)` — for
   development and no-SPIRE deployments.
 
-Both are read on every handshake and every request rather than
+All are read on every handshake and every request rather than
 snapshotted at construction, which is what makes rotation and
 withdrawal take effect without a restart.
+
+**`SPIFFEFileSource`, and why the Workload API is not enough.** GKE
+Managed Workload Identity does not expose a SPIFFE Workload API socket.
+Its CSI driver (`podcertificate.gke.io`) mounts credentials read-only as
+*files* under `/var/run/secrets/workload-spiffe-credentials` —
+`certificates.pem`, `private_key.pem`, `ca_certificates.pem`,
+`trust_bundles.json` — and rewrites them in place on rotation. So
+`workloadapi.X509Source`, the source every SPIFFE tutorial reaches for,
+cannot be used on the platform purser most needs to run on.
+
+`SPIFFEFileSource` closes that: it loads the triple, serves it from an
+`atomic.Pointer`, and re-reads on an interval (30s by default, against
+GKE's roughly five-minute trust-anchor propagation window). Design
+notes:
+
+- **Polling, not `fsnotify`.** The mount is rewritten rather than
+  renamed, inotify semantics across a CSI mount are not something to
+  bet admission on, and the propagation delay this races against is
+  measured in minutes. A ticker has no failure mode to reason about.
+- **A failed reload keeps the last good credential** and reports through
+  `OnError`. A truncated or half-written file must not take a healthy
+  workload offline.
+- **Torn reads are *not* self-detecting, so each generation is read
+  twice.** A mismatched cert and key is caught — `x509svid.Parse` checks
+  the key against the leaf's public key — but a truncated file is not:
+  go-spiffe's PEM reader discards a trailing partial block without
+  error, so a half-written three-certificate chain parses cleanly as a
+  two-certificate one. The sharp case is a CA rotation, where the bundle
+  grows from one anchor to two and a torn read lands on new-anchor-only:
+  every existing peer is rejected, with nothing logged. So `load` reads
+  all three files twice and compares the bytes, accepting a generation
+  only if the files held still across both reads. Two identical reads is
+  not a proof — a writer could finish in between — but it turns "a write
+  is in progress right now" from a silent wrong answer into a retry on
+  the next tick. An empty bundle is rejected outright for the same
+  reason.
+- **Retention is bounded by expiry on the SVID half only.** Keeping the
+  last good credential is unbounded on its own: if the mount becomes
+  permanently unreadable there is no next good tick. `GetX509SVID`
+  refuses to serve a leaf that has actually expired, so the process
+  fails locally and legibly instead of presenting a dead certificate and
+  collecting a TLS alert from the peer. The *bundle* has no equivalent
+  bound and cannot get one from here: a trust anchor is a long-lived CA
+  certificate, withdrawing one is an edit to the file rather than an
+  expiry, and a source that can no longer read the file cannot tell a
+  withdrawal from a mount glitch — so a revoked authority stays honoured
+  for as long as the mount stays broken. Where both halves come from one
+  source the SVID's expiry bounds this in practice, but that is a side
+  effect and it disappears when the halves are split: a
+  `workloadapi.X509Source` for the SVID beside this for the bundle keeps
+  presenting a fresh SVID while trusting a withdrawn authority
+  indefinitely. `OnError` is the only signal, so a deployment that
+  splits them should alert on it.
+- **`OnError` runs on one goroutine of the source's own, serialised.**
+  Calling it inline would put caller-supplied code on the reload loop's
+  critical path, where three ordinary things become severe: a callback
+  that blocks stops all future reloads, so the SVID quietly ages out
+  even after the files recover; a callback that calls `Close` — the
+  natural reaction to a credential failure — deadlocks, since `Close`
+  waits for the loop that is waiting for the callback; and a panic takes
+  down the process from a goroutine the caller never started and cannot
+  recover on. A panic in the callback is recovered and discarded.
+  Delivery is *one* long-lived goroutine draining a short queue rather
+  than a goroutine per failure, because the latter is unbounded: a
+  callback blocked on a wedged log sink would accumulate one goroutine
+  per tick, thousands a day, for as long as the mount stayed broken.
+  Once the queue fills, further errors are dropped — every one of them a
+  duplicate of the "reload is still failing" the first call already
+  delivered.
+- **`Close` waits for the reload goroutine, and that wait is not
+  bounded.** The loop notices `Close` only between ticks, so if it is
+  blocked inside `os.ReadFile` on a wedged mount, `Close` blocks with
+  it. Reads already fail by then — they check the closed flag, not the
+  goroutine — so what is lost is the caller's shutdown path rather than
+  any safety property. A timeout was considered and rejected: it trades
+  a visible hang for a silently leaked goroutine still writing to the
+  source, and a process whose credential mount has wedged is not going
+  to shut down cleanly regardless.
+- **The bundle is cloned per call.** `x509bundle.Bundle` looks immutable
+  and is not — `AddX509Authority` and `SetX509Authorities` are exported,
+  and x509bundle's own `GetX509BundleForTrustDomain` returns the
+  receiver rather than a copy. Handing out the live bundle would let any
+  holder promote an untrusted issuer for every concurrent handshake in
+  the process.
+- **Reads after `Close` fail**, matching `workloadapi.X509Source`. A
+  caller who wrote `defer src.Close()` in a function that returns the
+  `tls.Config` should find out at the next handshake, not at expiry.
+- **`TrustDomain` is a required option**, and the loaded SVID's own
+  domain is checked against it at construction. PEM on disk says nothing
+  about which trust domain it belongs to, and the symptom of getting it
+  wrong is a remote peer rejecting the connection.
+- **`ca_certificates.pem`, not `trust_bundles.json`.** The JSON form
+  carries federated bundles for other trust domains; federation is a
+  [deliberate gap](#deliberate-gaps) and reading it would imply support
+  purser does not have.
+
+The same type serves local development, where a test CA writes the same
+three files to a temp directory — one component covering both cells
+rather than a real one and a mock.
 
 go-spiffe v2.6.0 is already a transitive dependency of k8s-lookout, so
 it adds no new supply-chain surface there. Within purser it adds none at
@@ -538,8 +655,127 @@ says so outright: *"mTLS is not yet wired in the client (TODO
 follow-on)."*
 
 Both profiles: a stdlib `tls.Config` with a keypair plus `RootCAs` for
-PKI, and `tlsconfig.MTLSClientConfig(svid, bundle, authorizer)` for
-SPIFFE. Without this, phase 2 ships a server that nothing can talk to.
+PKI, and an SVID plus a bundle source for SPIFFE. Without this, phase 2
+ships a server that nothing can talk to.
+
+**The client verifies where the server verifies.** This design
+originally said to return `tlsconfig.MTLSClientConfig(svid, bundle,
+authorizer)` for the SPIFFE profile. It does not, and the reason is the
+one from ["Layer A and Layer B must not be
+conflated"](#layer-a-and-layer-b-must-not-be-conflated) applied to the
+other end of the connection: that helper sets `InsecureSkipVerify` and
+hangs go-spiffe's verification off `VerifyPeerCertificate`, which
+`crypto/tls` **skips on a resumed session** — Go's own comment in
+`handshake_client.go` reads *"Resumptions currently don't reverify
+certificates so they don't call verifyServerCertificate. See Issue
+31641."* With stdlib checking disabled and its only replacement skipped,
+a session ticket becomes the entire proof of the server's identity for
+that ticket's lifetime: an authority since withdrawn from the bundle
+keeps being accepted, and so does a server that a narrowed `Authorize`
+would now reject. Expiry of the server's leaf is the one thing
+`crypto/tls` still catches on its own — `loadSession` drops a cached
+session past `NotAfter` (`handshake_client.go:403`) and that check sits
+*above* the `!InsecureSkipVerify` guard, so it applies even to a config
+like go-spiffe's. Everything else on that path is the helper's to do and
+it does not do it. This is the same trap the SPIFFE
+*server* profile avoids by not using `MTLSServerConfig`, and the client
+avoids it the same way — go-spiffe's verification logic, moved onto
+`VerifyConnection`, which `crypto/tls` calls on both paths.
+`client.NewPKI` puts its optional `Admit` matcher there too, for
+symmetry and for the same reason.
+
+`client/mtls_test.go` pins both halves: purser rejects a resumed
+connection whose trust bundle has been emptied, and — in a sibling
+subtest that will fail if upstream ever closes the gap —
+`tlsconfig.MTLSClientConfig` accepts it.
+
+**`Authorize` is required on the client and `Admit` is optional on the
+server.** The asymmetry is deliberate. A server admits a *population*;
+every workload its authority issues to may legitimately connect. A
+client dials *one known service*, so "any SVID in the trust domain"
+includes every compromised peer that can win a race for the address.
+A caller who genuinely means it passes `spiffeid.MatchAny()` and says so
+in the source.
+
+**The ECH-rejection path looks like a second hole and is not one.** It
+is recorded here because the resemblance is strong enough that an
+earlier revision of this package acted on it, and the fix was wrong
+twice over.
+
+The setup is real: when a caller sets `EncryptedClientHelloConfigList`
+and the server rejects ECH, `crypto/tls` guards *both*
+`VerifyPeerCertificate` and `VerifyConnection` with `&& !echRejected`
+(`handshake_client.go:1127`) and verifies through
+`EncryptedClientHelloRejectionVerify` instead — falling back, if that
+hook is unset, to a chain build against `RootCAs` that does not consult
+`InsecureSkipVerify`. Read on its own, that says an ECH-rejected SPIFFE
+connection would be verified against the system roots with no SPIFFE
+check at all.
+
+It never gets that far. On rejection the TLS 1.3 client sends
+`alertECHRequired` and returns `*tls.ECHRejectionError` before setting
+`isHandshakeComplete` (`handshake_client_tls13.go:151-154`), whatever
+the hook decided. The only route around that abort is TLS 1.2, and
+`crypto/tls` refuses to offer ECH at all unless `MinVersion` is 1.3 or
+unset (`handshake_client.go:175-180`) — both client constructors always
+set `MinVersion`, so a purser config takes one error or the other. There
+is no reachable state in which an ECH-rejected connection carries
+traffic.
+
+And the hook could not verify anything if there were. `crypto/tls` calls
+it with the `ConnectionState` built at `handshake_client.go:1130`,
+fifty-nine lines *before* `c.peerCertificates = certs` at `:1189`, so
+`PeerCertificates` is empty and any honest hook fails unconditionally.
+Installing one is therefore not neutral: it converts a clean
+`ECHRejectionError` — which carries the `RetryConfigs` a client needs to
+recover from a stale ECH config — into a `bad_certificate` alert and a
+misleading complaint about the server's chain.
+
+So neither constructor sets the hook, and `TestECHRejectionNeedsNoHook`
+pins both reasons with real handshakes rather than by calling the hook
+directly: one subtest drives an actual ECH rejection with the most
+permissive hook possible and requires the handshake to fail anyway, and
+another records what the hook was passed and requires it to be empty. If
+a future Go moves that assignment, the second fails — and the first is
+the one to re-read, because it is what makes the path unreachable.
+
+**Mispairing a client and server profile is a configuration error, not
+a security boundary.** The package comment says so explicitly, because
+the stronger claim is false and a test proves it: a SPIFFE client
+dialling a PKI listener succeeds whenever that listener's certificate
+happens to be SVID-shaped and issued by an authority in the client's
+bundle — a live state during a migration to SPIFFE. The PKI direction
+does fail, but incidentally: an X509-SVID carries a URI SAN and no DNS
+name, so the standard hostname check has nothing to match. The real
+protection against mispairing is that the constructors return the config
+and its authenticator together.
+
+**`Transport(cfg)`** exists because `net/http` upgrades a transport to
+HTTP/2 automatically only while `TLSClientConfig` is nil. Setting one —
+which mTLS requires — silently drops back to HTTP/1.1 unless
+`ForceAttemptHTTP2` is also set. It clones both the transport it starts
+from and the config it installs. Cloning `http.DefaultTransport` is
+obvious — every other client in the process is using it. Cloning the
+*config* is less so: `net/http`'s HTTP/2 setup appends to
+`TLSClientConfig.NextProtos` **in place** (`h2_bundle.go:7539`), so a
+caller who kept the config to dial with directly, or handed it to a
+second transport, would find ALPN protocols in it that it never asked
+for. Cloning is not quite enough on its own — `tls.Config.Clone` copies
+the slice header and shares the backing array (`common.go:1014`), so the
+installed `NextProtos` is clipped to force the append to reallocate.
+
+Two smaller decisions there. `Transport(nil)` **panics**: `net/http`
+reads a nil config as the system roots and no client certificate, so the
+alternative is a transport built for mTLS that quietly cannot
+authenticate and trusts every CA a browser does — and neither
+constructor returns a nil config with a nil error, so reaching it means
+an unchecked error above. And the fallback branch, taken when
+`http.DefaultTransport` has been replaced by something that is not an
+`*http.Transport`, sets its own `DialContext`: without one `net/http`
+dials through a zero `net.Dialer` with no connect timeout at all, which
+would make that branch strictly more dangerous than the `Clone` branch
+it stands in for, and only on the machines where the type assertion
+happens to fail.
 
 ### `AuthSource` as a typed value
 
@@ -627,25 +863,56 @@ self-contained.
    accepted SPIFFE connection and populated on an accepted PKI
    connection, and that identity resolves correctly in both. This is the
    property that breaks naive middleware, so it gets pinned.
-5. **Matcher adversarial suite.** The substring escape is a named test:
+5. **Session-resumption regression test, both ends.** Connect once so a
+   ticket is cached, withdraw the peer's authority from the trust
+   bundle, connect again, and assert the *resumed* handshake is
+   rejected. Assert `DidResume`, so the test cannot pass by quietly
+   doing a full handshake. Run it against `mtls.NewSPIFFE` and
+   `client.NewSPIFFE`, and pin the upstream gap alongside: the same
+   scenario through `tlsconfig.MTLSClientConfig` / `MTLSServerConfig`
+   succeeds, and the day it stops doing so the test fails and the
+   deviation gets revisited.
+6. **ECH-rejection unreachability test.** The sibling of the resumption
+   test, for the hole that turns out not to be one. Configure ECH on a
+   purser client config, dial a server that has never heard of it, and
+   assert the handshake fails with `*tls.ECHRejectionError` even with
+   the most permissive `EncryptedClientHelloRejectionVerify` installed —
+   and, separately, that `crypto/tls` passes that hook a
+   `ConnectionState` with no peer certificates. Both are statements
+   about the standard library, so both are written to fail loudly if a
+   future Go changes them.
+7. **`SPIFFEFileSource` rotation and hostile-caller tests.** Rewrite the
+   mounted files and assert the new SVID is served without a restart;
+   write a torn pair and assert the last good credential survives and
+   `OnError` fires. Rewrite the bundle continuously between one anchor
+   and two and assert a torn generation is *reported*, not accepted —
+   the double read is the only thing standing between a CA rotation and
+   a silent new-anchor-only bundle. Assert the source refuses an expired
+   SVID once the mount is gone, that a returned bundle cannot be mutated
+   into the source's own, and that an `OnError` which blocks, calls
+   `Close`, or panics neither freezes rotation nor takes the process
+   down. Assert too that `OnError` calls never overlap: serialised
+   delivery is what keeps a blocked callback from costing a goroutine
+   per failed reload.
+8. **Matcher adversarial suite.** The substring escape is a named test:
    `MatchPathSegments("ns", "prod")` must reject
    `spiffe://td/ns/attacker/x/ns/prod/sa/y`, which `strings.Contains`
    accepts. Table-test the GCP helpers against real-shaped GKE and Agent
    Engine IDs, with wrong-trust-domain negatives.
-6. **Layer separation test.** With a permissive admission policy, assert
+9. **Layer separation test.** With a permissive admission policy, assert
    the `Caller` is still fully populated — pinning that admission policy
    never degrades identity extraction.
-7. **OIDC end-to-end** via `authtest.NewIssuer()`: a valid token
+10. **OIDC end-to-end** via `authtest.NewIssuer()`: a valid token
    resolves; wrong audience, expired, and rotated-key-not-yet-cached are
    all rejected.
-8. **Differential test against the source of truth.** Table-drive the
+11. **Differential test against the source of truth.** Table-drive the
    ported `Authorize`, browser write guard, and transport-gate cases
    from core-agent's existing `pkg/auth/*_test.go` and
    `pkg/attach/{csrf,auth,caller_middleware}_test.go`. Passing them
    unchanged is the evidence the lift preserved behavior.
-9. `examples/` server and client exercising both mTLS profiles end to
+12. `examples/` server and client exercising both mTLS profiles end to
    end, wired into a `dev/ci/presubmits` smoke script.
-10. `dev/tools/ci` green — including `lint-go` and `verify-apidiff`.
+13. `dev/tools/ci` green — including `lint-go` and `verify-apidiff`.
 
 ## Phase 1b — service mesh (optional)
 
@@ -719,3 +986,18 @@ Operator-facing documentation under core-agent's
   [`pkg/auth/authenticator.go:33`](https://github.com/go-steer/core-agent/blob/09b6cd1d9c97fa1e2673bac2e664d97579c68b24/pkg/auth/authenticator.go#L33),
   is not in the phase-1a scope. On GKE it is largely subsumed by the
   SPIFFE profile's workload-identity path.
+- **SPIFFE federation.** `SPIFFEFileSource` reads
+  `ca_certificates.pem` — the anchors for its own trust domain — and
+  ignores GKE's `trust_bundles.json`, which carries federated bundles
+  for others. A cross-trust-domain deployment needs a multi-domain
+  bundle source; nothing in the design precludes one, and no consumer
+  has asked.
+- **GKE self-managed workload identity pools.** `MatchGKEWorkload`
+  builds the fleet trust domain, `PROJECT_ID.svc.id.goog`, which is what
+  Managed Workload Identity issues by default and what GKE's own guide
+  walks an operator through. A self-managed pool in `TRUST_DOMAIN` mode
+  issues under
+  `POOL_ID.global.POOL_HOST_PROJECT_NUMBER.workload.id.goog` instead.
+  That is a missing matcher rather than a wrong one — such a deployment
+  can compose `spiffeid.MatchMemberOf` today — and it lands when someone
+  runs that configuration.
