@@ -1,0 +1,39 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Registration: which pods get which SPIFFE ID.
+#
+# This is spire-controller-manager's CRD, not a purser concept. It is
+# here because without it the workloads below have no identity at all
+# and the SPIFFE profile has nothing to read — SPIRE issues an SVID only
+# to a workload some registration entry names.
+#
+# The template gives every pod in this namespace an ID derived from its
+# service account, which is the same shape GKE's managed workload
+# identity produces:
+#
+#   spiffe://TRUST_DOMAIN/ns/purser-example-spiffe/sa/hello-server
+#
+# That is not a coincidence and it is worth copying: identity keyed to
+# the service account means a workload's name follows from how it was
+# deployed, not from a certificate someone remembered to request.
+apiVersion: spire.spiffe.io/v1alpha1
+kind: ClusterSPIFFEID
+metadata:
+  name: purser-example
+spec:
+  spiffeIDTemplate: "spiffe://{{ .TrustDomain }}/ns/{{ .PodMeta.Namespace }}/sa/{{ .PodSpec.ServiceAccountName }}"
+  namespaceSelector:
+    matchLabels:
+      kubernetes.io/metadata.name: purser-example-spiffe

@@ -1,0 +1,183 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: hello-server
+  namespace: purser-example-spiffe
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hello-server
+  namespace: purser-example-spiffe
+spec:
+  selector:
+    app: hello-server
+  ports:
+    - name: https
+      port: 8443
+      targetPort: https
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hello-server
+  namespace: purser-example-spiffe
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: hello-server
+  template:
+    metadata:
+      labels:
+        app: hello-server
+    spec:
+      serviceAccountName: hello-server
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        # Both containers run as this uid, so the 0600 private key
+        # spiffe-helper writes into the shared volume is readable by
+        # the process that needs it and by nothing else.
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+
+      initContainers:
+        # A native sidecar (restartPolicy: Always), not an ordinary
+        # container. Ordering is the reason: hello-server reads its SVID
+        # at startup and exits if it is not there, so the credential has
+        # to exist before the main container is started, and only an
+        # init container with a startupProbe can promise that.
+        - name: spiffe-helper
+          image: ghcr.io/spiffe/spiffe-helper:0.11.0
+          restartPolicy: Always
+          args: ["-config", "/etc/spiffe-helper/helper.conf"]
+          startupProbe:
+            httpGet:
+              path: /ready
+              port: 8081
+            # Ready means the SVID, key and bundle are on disk.
+            periodSeconds: 2
+            failureThreshold: 60
+          livenessProbe:
+            httpGet:
+              path: /live
+              port: 8081
+            periodSeconds: 30
+          volumeMounts:
+            - name: spiffe-workload-api
+              mountPath: /spiffe-workload-api
+              readOnly: true
+            - name: spiffe-helper-config
+              mountPath: /etc/spiffe-helper
+              readOnly: true
+            - name: svids
+              mountPath: /var/run/secrets/workload-spiffe-credentials
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+
+      containers:
+        - name: hello-server
+          image: purser-examples:latest
+          imagePullPolicy: IfNotPresent
+          command: ["/hello-server"]
+          args:
+            - -profile=spiffe
+            - -addr=0.0.0.0:8443
+            - -admin-addr=0.0.0.0:8080
+            # The same directory GKE's managed workload identity mounts,
+            # and the default when -spiffe-dir is empty. It is spelled
+            # out here because the sidecar above has to be told to write
+            # to it, and the two must agree.
+            - -spiffe-dir=/var/run/secrets/workload-spiffe-credentials
+            - -spiffe-trust-domain=$(TRUST_DOMAIN)
+            # Admission: exactly one caller, named. The trust bundle
+            # verifies every SVID in the trust domain, which is most of
+            # the cluster; verifying is not authorizing.
+            - -spiffe-admit-id=spiffe://$(TRUST_DOMAIN)/ns/purser-example-spiffe/sa/hello-client
+            - -name=$(POD_NAME)
+          env:
+            - name: TRUST_DOMAIN
+              valueFrom:
+                configMapKeyRef:
+                  name: purser-example
+                  key: trust_domain
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          ports:
+            - name: https
+              containerPort: 8443
+            - name: admin
+              containerPort: 8080
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: admin
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: admin
+            periodSeconds: 5
+          volumeMounts:
+            - name: svids
+              mountPath: /var/run/secrets/workload-spiffe-credentials
+              readOnly: true
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+
+      volumes:
+        # The SPIRE agent's Workload API socket, delivered by the SPIFFE
+        # CSI driver. The pod never mounts a hostPath: the driver hands
+        # over only the socket, and only to pods that ask.
+        - name: spiffe-workload-api
+          csi:
+            driver: csi.spiffe.io
+            readOnly: true
+        - name: spiffe-helper-config
+          configMap:
+            name: spiffe-helper
+        # The SVID lives here and nowhere else — memory-backed, gone
+        # with the pod, never in a Secret and never in etcd.
+        - name: svids
+          emptyDir:
+            medium: Memory

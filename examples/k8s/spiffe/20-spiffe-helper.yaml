@@ -1,0 +1,68 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# The bridge from SPIRE's Workload API to files on disk.
+#
+# purser reads SVIDs from files, so something has to put them there.
+# spiffe-helper is that something: it talks to the SPIRE agent over the
+# Workload API socket, writes the SVID, key and bundle into a shared
+# volume, and rewrites them before they expire.
+#
+# Why files and not the Workload API directly:
+#
+#   - GKE's managed workload identity offers no agent socket. It
+#     publishes exactly these three files and nothing else. One code
+#     path across local, SPIRE and GKE keeps the three cells
+#     comparable — the container arguments in this cell and in
+#     examples/gke-mwid differ only in the trust domain.
+#   - A go-spiffe workloadapi.X509Source would pull grpc and protobuf
+#     into purser's module graph, which every consumer of the library
+#     would then carry. purser stays out of that dependency, and a
+#     service that wants the socket can still pass an X509Source into
+#     the same two fields.
+#
+# The file names below are not arbitrary. They are what GKE writes, and
+# what mtls.GKECertFile, mtls.GKEKeyFile and mtls.GKEBundleFile name.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: spiffe-helper
+  namespace: purser-example-spiffe
+data:
+  helper.conf: |
+    agent_address = "/spiffe-workload-api/spire-agent.sock"
+
+    cert_dir              = "/var/run/secrets/workload-spiffe-credentials"
+    svid_file_name        = "certificates.pem"
+    svid_key_file_name    = "private_key.pem"
+    svid_bundle_file_name = "ca_certificates.pem"
+
+    # Keep running and keep the files current. No cmd and no
+    # renew_signal: purser's SPIFFEFileSource re-reads them on its own
+    # interval, so there is nothing to signal.
+    daemon_mode = true
+
+    cert_file_mode = 0644
+    key_file_mode  = 0600
+
+    # The gate that stops hello-server from starting before it has a
+    # credential. Readiness here means the X.509 files have been
+    # written, which is exactly the precondition the startupProbe in
+    # the Deployments waits on.
+    health_checks {
+      listener_enabled = true
+      bind_port        = 8081
+      liveness_path    = "/live"
+      readiness_path   = "/ready"
+    }

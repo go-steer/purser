@@ -1,0 +1,168 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# The PKI for the standard-CA cell, issued by cert-manager.
+#
+# cert-manager is doing the job mint-credentials does locally: it is the
+# internal CA a real deployment already has. Nothing here is a purser
+# concept — purser only ever reads the three PEM files at the end of it.
+#
+# Keys never leave the cluster and never enter this repository. Each
+# Certificate below produces a Secret that cert-manager fills in and
+# rotates; the Deployments mount the Secret.
+
+---
+# A self-signed issuer, used once: to sign the CA below. In a real
+# deployment this is where an external root or an intermediate from a
+# corporate CA goes instead.
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: selfsigned
+  namespace: purser-example-pki
+spec:
+  selfSigned: {}
+
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: example-ca
+  namespace: purser-example-pki
+spec:
+  isCA: true
+  commonName: purser-example-ca
+  secretName: example-ca
+  duration: 8760h # 1 year
+  renewBefore: 720h # 30 days
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+  issuerRef:
+    name: selfsigned
+    kind: Issuer
+    group: cert-manager.io
+
+---
+# The issuer both workloads chain to. Its certificate is what
+# -pki-peer-ca points at on each side, which is the whole trust
+# relationship: a peer is admitted at the TLS layer if and only if it
+# holds something this CA signed.
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: example-ca
+  namespace: purser-example-pki
+spec:
+  ca:
+    secretName: example-ca
+
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: hello-server
+  namespace: purser-example-pki
+spec:
+  secretName: hello-server-tls
+  commonName: hello-server
+  # The client dials the Service name, so it has to be a SAN. Both
+  # spellings, because either is a legitimate way to reach it.
+  dnsNames:
+    - hello-server.purser-example-pki.svc
+    - hello-server.purser-example-pki.svc.cluster.local
+  usages:
+    - server auth
+    - client auth
+  duration: 2160h # 90 days
+  renewBefore: 360h # 15 days
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Always
+  issuerRef:
+    name: example-ca
+    kind: Issuer
+    group: cert-manager.io
+
+---
+# The authorized client.
+#
+# Two fields carry meaning to purser and they are separate on purpose:
+#
+#   - the DNS SAN is the identity, because the server runs with
+#     -pki-subject san_dns
+#   - the OU is the admission decision, because the server runs with
+#     -pki-admit-ou platform
+#
+# Identity is who you are; admission is whether you may connect. A
+# deployment that conflates them ends up with an allowlist of hostnames.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: hello-client
+  namespace: purser-example-pki
+spec:
+  secretName: hello-client-tls
+  commonName: hello-client
+  dnsNames:
+    - hello-client.purser-example-pki.svc
+  subject:
+    organizationalUnits:
+      - platform
+  usages:
+    - client auth
+  duration: 2160h # 90 days
+  renewBefore: 360h # 15 days
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Always
+  issuerRef:
+    name: example-ca
+    kind: Issuer
+    group: cert-manager.io
+
+---
+# The client that must be refused.
+#
+# It is signed by the same CA and is valid in every respect. Only its OU
+# differs. That is the point of the cell: chaining to the shared
+# internal CA is not an authorization decision, and a service that
+# treats it as one admits every workload in the cluster that CA serves.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: hello-intruder
+  namespace: purser-example-pki
+spec:
+  secretName: hello-intruder-tls
+  commonName: hello-intruder
+  dnsNames:
+    - hello-intruder.purser-example-pki.svc
+  subject:
+    organizationalUnits:
+      - interns
+  usages:
+    - client auth
+  duration: 2160h # 90 days
+  renewBefore: 360h # 15 days
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Always
+  issuerRef:
+    name: example-ca
+    kind: Issuer
+    group: cert-manager.io
