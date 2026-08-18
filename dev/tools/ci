@@ -53,6 +53,9 @@ STEPS=(
   # uncommitted edits — which is the point of running it before you push.
   "apidiff   dev/tools/verify-apidiff"
   "test      dev/tools/test-unit"
+  # The seam the unit suite cannot reach: the example's two binaries
+  # talking to each other over real sockets, under both mTLS profiles.
+  "smoke     dev/tools/smoke"
   "vuln      dev/tools/verify-vuln"
 )
 
