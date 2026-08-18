@@ -36,6 +36,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
@@ -84,6 +85,7 @@ type Flags struct {
 	PKIPeerCA  string
 	PKISubject string
 	PKIAdmitOU string
+	PKIReload  time.Duration
 
 	// SPIFFE profile.
 	SPIFFEDir         string
@@ -108,6 +110,8 @@ func (f *Flags) Register(fs *flag.FlagSet, role Role) {
 		"pki: PEM file of the authorities the peer's certificate must chain to")
 	fs.StringVar(&f.PKIAdmitOU, "pki-admit-ou", "",
 		"pki: admit only peers whose certificate carries this organizational unit (optional)")
+	fs.DurationVar(&f.PKIReload, "pki-reload", 0,
+		"pki: how often to re-read the certificate and key; 0 means 30s, negative pins them for the process lifetime")
 
 	fs.StringVar(&f.SPIFFEDir, "spiffe-dir", "",
 		"spiffe: directory holding "+mtls.GKECertFile+", "+mtls.GKEKeyFile+" and "+
@@ -147,7 +151,7 @@ type Closer func() error
 func (f *Flags) Server(log *slog.Logger) (*tls.Config, authn.Authenticator, Closer, error) {
 	switch f.Profile {
 	case PKI:
-		cfg, auth, err := f.serverPKI()
+		cfg, auth, err := f.serverPKI(log)
 		return cfg, auth, noopCloser, err
 	case SPIFFE:
 		return f.serverSPIFFE(log)
@@ -163,7 +167,7 @@ func (f *Flags) Server(log *slog.Logger) (*tls.Config, authn.Authenticator, Clos
 func (f *Flags) Client(log *slog.Logger) (*tls.Config, Closer, error) {
 	switch f.Profile {
 	case PKI:
-		cfg, err := f.clientPKI()
+		cfg, err := f.clientPKI(log)
 		return cfg, noopCloser, err
 	case SPIFFE:
 		return f.clientSPIFFE(log)
@@ -172,8 +176,8 @@ func (f *Flags) Client(log *slog.Logger) (*tls.Config, Closer, error) {
 	}
 }
 
-func (f *Flags) serverPKI() (*tls.Config, *mtls.PKIAuth, error) {
-	cert, pool, err := f.pkiMaterial()
+func (f *Flags) serverPKI(log *slog.Logger) (*tls.Config, *mtls.PKIAuth, error) {
+	certs, pool, err := f.pkiMaterial(log)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -182,30 +186,35 @@ func (f *Flags) serverPKI() (*tls.Config, *mtls.PKIAuth, error) {
 		return nil, nil, fmt.Errorf("unknown -pki-subject %q", f.PKISubject)
 	}
 	return mtls.NewPKI(mtls.PKIOptions{
-		Certificate: &cert,
-		ClientCAs:   pool,
-		Subject:     subject,
-		Admit:       f.pkiAdmit(),
-		NextProtos:  ALPN,
+		// GetCertificate, not Certificate: see pkiCertSource.
+		GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+			return certs.get(), nil
+		},
+		ClientCAs:  pool,
+		Subject:    subject,
+		Admit:      f.pkiAdmit(),
+		NextProtos: ALPN,
 	})
 }
 
-func (f *Flags) clientPKI() (*tls.Config, error) {
-	cert, pool, err := f.pkiMaterial()
+func (f *Flags) clientPKI(log *slog.Logger) (*tls.Config, error) {
+	certs, pool, err := f.pkiMaterial(log)
 	if err != nil {
 		return nil, err
 	}
 	return client.NewPKI(client.PKIOptions{
-		Certificate: &cert,
-		RootCAs:     pool,
-		Admit:       f.pkiAdmit(),
-		NextProtos:  ALPN,
+		GetClientCertificate: func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
+			return certs.get(), nil
+		},
+		RootCAs:    pool,
+		Admit:      f.pkiAdmit(),
+		NextProtos: ALPN,
 	})
 }
 
 // pkiMaterial loads this process's own certificate and the pool its
 // peer must chain to.
-func (f *Flags) pkiMaterial() (tls.Certificate, *x509.CertPool, error) {
+func (f *Flags) pkiMaterial(log *slog.Logger) (*pkiCertSource, *x509.CertPool, error) {
 	var missing []string
 	for name, v := range map[string]string{
 		"-pki-cert":    f.PKICert,
@@ -218,25 +227,110 @@ func (f *Flags) pkiMaterial() (tls.Certificate, *x509.CertPool, error) {
 	}
 	if len(missing) > 0 {
 		slices.Sort(missing) // map order is random; the error text should not be
-		return tls.Certificate{}, nil, fmt.Errorf("-profile %s needs %s", PKI, strings.Join(missing, ", "))
+		return nil, nil, fmt.Errorf("-profile %s needs %s", PKI, strings.Join(missing, ", "))
 	}
 
-	cert, err := tls.LoadX509KeyPair(f.PKICert, f.PKIKey)
+	certs, err := newPKICertSource(f.PKICert, f.PKIKey, f.PKIReload, log)
 	if err != nil {
-		return tls.Certificate{}, nil, fmt.Errorf("load certificate: %w", err)
+		return nil, nil, err
 	}
 	pem, err := os.ReadFile(f.PKIPeerCA)
 	if err != nil {
-		return tls.Certificate{}, nil, fmt.Errorf("read -pki-peer-ca: %w", err)
+		return nil, nil, fmt.Errorf("read -pki-peer-ca: %w", err)
 	}
 	// A fresh pool, never x509.SystemCertPool: the peer of an internal
 	// service chains to the internal CA, and starting from the system
 	// roots would admit every CA a browser trusts.
+	//
+	// Unlike the certificate, the pool is a snapshot: crypto/tls has no
+	// per-handshake hook for ClientCAs, and neither does purser. A
+	// deployment that rotates its *authority* has to restart. Rotating
+	// a leaf, which is the every-90-days case, does not.
 	pool := x509.NewCertPool()
 	if !pool.AppendCertsFromPEM(pem) {
-		return tls.Certificate{}, nil, fmt.Errorf("read -pki-peer-ca: %s holds no PEM certificate", f.PKIPeerCA)
+		return nil, nil, fmt.Errorf("read -pki-peer-ca: %s holds no PEM certificate", f.PKIPeerCA)
 	}
-	return cert, pool, nil
+	return certs, pool, nil
+}
+
+// pkiCertSource re-reads a certificate and key from disk, at most once
+// per interval, and serves the last good pair.
+//
+// The alternative — loading once and passing PKIOptions.Certificate —
+// pins the leaf for the life of the process. That is invisible in a
+// demo and wrong in a deployment: cert-manager rewrites the mounted
+// Secret in place when it renews, and a process holding the old leaf
+// keeps serving it until something restarts the pod, which by default
+// is nothing. purser offers GetCertificate for exactly this, and an
+// example that ignored it would teach the pinned pattern to everyone
+// who copied it.
+//
+// There is no goroutine and no Close here, unlike mtls.SPIFFEFileSource:
+// reloading lazily on the first handshake after the interval elapses
+// needs neither, and a process with no traffic has nothing to refresh
+// for.
+type pkiCertSource struct {
+	certPath string
+	keyPath  string
+	interval time.Duration
+	log      *slog.Logger
+
+	mu     sync.Mutex
+	cert   *tls.Certificate
+	loaded time.Time
+}
+
+// defaultPKIReload matches mtls.SPIFFEFileSource's default, so the two
+// profiles behave the same when neither reload flag is given.
+const defaultPKIReload = 30 * time.Second
+
+func newPKICertSource(
+	certPath, keyPath string,
+	interval time.Duration,
+	log *slog.Logger,
+) (*pkiCertSource, error) {
+	switch {
+	case interval == 0:
+		interval = defaultPKIReload
+	case interval < 0:
+		interval = 0 // pinned: never reload
+	}
+	s := &pkiCertSource{certPath: certPath, keyPath: keyPath, interval: interval, log: log}
+
+	// Loaded eagerly so an unreadable path or a mismatched key is a
+	// startup error rather than a handshake failure hours later.
+	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
+	if err != nil {
+		return nil, fmt.Errorf("load certificate: %w", err)
+	}
+	s.cert = &cert
+	s.loaded = time.Now()
+	return s, nil
+}
+
+// get returns the current certificate, reloading first if the interval
+// has elapsed. A failed reload keeps the last good pair: a half-written
+// Secret must not take a healthy workload offline.
+func (s *pkiCertSource) get() *tls.Certificate {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.interval <= 0 || time.Since(s.loaded) < s.interval {
+		return s.cert
+	}
+	// Stamped whether or not the load succeeds, so a permanently broken
+	// file is retried on the interval rather than on every handshake.
+	s.loaded = time.Now()
+
+	cert, err := tls.LoadX509KeyPair(s.certPath, s.keyPath)
+	if err != nil {
+		// A deployment that ignores this learns its certificate stopped
+		// refreshing only when it expires. Alert on this line.
+		s.log.Error("certificate reload failed; still serving the last good one", "err", err)
+		return s.cert
+	}
+	s.cert = &cert
+	return s.cert
 }
 
 // pkiAdmit is the optional Layer A check. Nil admits every peer whose

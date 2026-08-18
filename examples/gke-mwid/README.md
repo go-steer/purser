@@ -1,12 +1,20 @@
 # The example on GKE, with managed workload identity
 
 The same hello-world server and clients as
-[`../k8s/spiffe/`](../k8s/spiffe/), with the spiffe-helper sidecar
-deleted. GKE's managed workload identity (MWID) issues each pod an
-X.509-SVID from a Google-managed CA and mounts it — certificate, key and
-trust anchors — under the same three file names spiffe-helper was
-configured to write. The container arguments differ only in the trust
-domain.
+[`../k8s/spiffe/`](../k8s/spiffe/). GKE's managed workload identity
+(MWID) issues each pod an X.509-SVID from a Google-managed CA and mounts
+it — certificate, key and trust anchors — under the same three file
+names spiffe-helper was configured to write, so the Go code is
+byte-for-byte the same and only the deployment moves:
+
+- the spiffe-helper sidecar and the SPIRE agent socket are gone, and the
+  emptyDir they filled is replaced by a `podcertificate.gke.io` CSI
+  volume that GKE fills itself;
+- the trust domain is the fleet's, `PROJECT_ID.svc.id.goog`;
+- peers are named with `-spiffe-admit-gke` / `-spiffe-authorize-gke`
+  instead of `-spiffe-admit-id` / `-spiffe-authorize-id`, which is a
+  convenience over the same matcher, not a different check;
+- Standard clusters need a `nodeSelector` for the metadata server.
 
 That is the argument for reading credentials from files rather than from
 an agent socket, made concrete: MWID publishes no SPIFFE Workload API to
@@ -15,9 +23,11 @@ dial. See [`../README.md`](../) for the longer version.
 ## What you need first
 
 MWID is a fleet-level feature. The setup below is Google's, not
-purser's; the [current
-documentation](https://cloud.google.com/kubernetes-engine/docs/how-to/managed-workload-identity)
-is authoritative and this is a summary of the shape of it.
+purser's; [what it
+is](https://cloud.google.com/iam/docs/managed-workload-identity) and
+[how to turn it
+on](https://cloud.google.com/iam/docs/create-managed-workload-identities-gke)
+are authoritative and this is a summary of the shape of it.
 
 1. **A fleet.** The cluster must be registered to a fleet, and the trust
    domain is the *fleet host project's* workload identity pool —
@@ -145,11 +155,18 @@ missing certificate issuance config in the node's region.
 65532 with `fsGroup: 65532`, which is what a `restricted`-profile
 namespace wants. Google's documentation does not specify the ownership
 or mode the driver applies to the mounted files, and it has changed
-before. If the process cannot read them, drop the `runAsUser` /
-`runAsGroup` / `runAsNonRoot` overrides from the pod `securityContext`
-(and the `restricted` label from the namespace) to confirm that is the
-cause, then set `fsGroup` to whatever `ls -l` on the mount actually
-shows.
+before. Look at what is actually on disk rather than relaxing the pod:
+
+```
+kubectl -n purser-example-gke debug -it deploy/hello-server \
+  --image=busybox --target=hello-server \
+  -- ls -ln /var/run/secrets/workload-spiffe-credentials
+```
+
+Then set `fsGroup` to the gid that shows, or `runAsUser` to the uid.
+Dropping `runAsNonRoot` or the namespace's `restricted` label would also
+make the read succeed, and is the wrong fix: it trades a file-mode
+problem for a privileged pod.
 
 **Wrong trust domain.** `-spiffe-trust-domain` must be the fleet
 project's pool, `PROJECT_ID.svc.id.goog`, not the cluster name and not a

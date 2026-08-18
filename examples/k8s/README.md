@@ -135,9 +135,12 @@ SVID at startup and exits if it is not there. The `startupProbe` on
 spiffe-helper's `/ready` — which reports ready only once the files are
 on disk — is what holds the main container back until it is.
 
-The SVID never touches a Secret and never reaches etcd.
-`fsGroup: 65532` is what lets the app container read the `0600` key the
-sidecar writes; both run as uid 65532.
+The SVID never touches a Secret and never reaches etcd. Both containers
+run as uid 65532, so the `0600` key spiffe-helper writes is readable by
+the app container as its *owner* — mode `0600` grants the group nothing,
+and `fsGroup` is not what makes this work. It is set so that the
+emptyDir itself is group-owned by 65532 and the sidecar can create files
+in it at all.
 
 ### If nothing gets an SVID
 

@@ -57,7 +57,13 @@ case "${1:-both}" in
 esac
 
 WORK="$(mktemp -d)"
+
+# Set by start_server, read by everything after it. They are globals
+# rather than a return value because $( ) forks: a PID assigned inside a
+# command substitution belongs to a subshell that exits immediately, and
+# the parent's kill would silently have nothing to kill.
 SERVER_PID=""
+SERVER_ADDR=""
 
 cleanup() {
   if [[ -n "$SERVER_PID" ]] && kill -0 "$SERVER_PID" 2>/dev/null; then
@@ -83,15 +89,19 @@ note "$BIN"
 
 # start_server <log-file> <flags...>
 #
-# Starts hello-server on an ephemeral port and echoes the address it
-# actually bound. -addr-file is written after the socket is bound, so a
+# Starts hello-server on an ephemeral port and sets SERVER_PID and
+# SERVER_ADDR. -addr-file is written after the socket is bound, so a
 # client that dials the instant it appears is queued rather than
 # refused — there is no sleep here and no race.
+#
+# Nothing here may run in a subshell: SERVER_PID has to survive into the
+# caller for stop_server and the EXIT trap to be able to reap the child.
 start_server() {
   local log="$1"
   shift
   local addr_file="$WORK/addr"
   rm -f "$addr_file"
+  SERVER_ADDR=""
 
   "$BIN/hello-server" \
     -addr "127.0.0.1:0" \
@@ -114,7 +124,7 @@ start_server() {
       fail "hello-server did not bind a port within 10s"
     fi
   done
-  cat "$addr_file"
+  SERVER_ADDR="$(<"$addr_file")"
 }
 
 stop_server() {
@@ -179,18 +189,18 @@ run_profile() {
       ;;
   esac
 
-  local addr
-  addr="$(start_server "$log" "${server_flags[@]}")"
-  note "hello-server listening on https://$addr"
+  start_server "$log" "${server_flags[@]}"
+  note "hello-server listening on https://$SERVER_ADDR"
 
   say "$profile: the authorized client"
   # Retries cover the gap between bind and accept on a cold process.
+  # `set -o pipefail` above is what makes the status of this pipeline
+  # the client's rather than sed's.
   if ! "$BIN/hello-client" \
-    -url "https://$addr" \
+    -url "https://$SERVER_ADDR" \
     -count 1 -retries 10 -retry-delay 200ms \
     "${authorized_flags[@]}" | sed 's/^/  /'; then
     cat "$log" >&2
-    stop_server
     fail "$profile: the authorized client was refused"
   fi
 
@@ -198,14 +208,25 @@ run_profile() {
   # No retries: the expected outcome is a refusal, and retrying a
   # refusal just makes the demo slower.
   if "$BIN/hello-client" \
-    -url "https://$addr" \
+    -url "https://$SERVER_ADDR" \
     -count 1 -retries 0 \
     "${unauthorized_flags[@]}" >"$WORK/unauthorized.out" 2>&1; then
     cat "$WORK/unauthorized.out" >&2
-    stop_server
     fail "$profile: the unauthorized client got in"
   fi
-  note "refused, as it should be:"
+
+  # A non-zero exit is not enough. hello-client exits 1 for a missing
+  # file, an unknown flag or a dead server too, so an assertion that
+  # only reads the status would keep passing after mint-credentials
+  # stopped writing the unauthorized identity at all. Insist the
+  # refusal came from the TLS layer, which is the thing being
+  # demonstrated.
+  if ! grep -qE 'remote error: tls:|certificate required|bad certificate' \
+    "$WORK/unauthorized.out"; then
+    cat "$WORK/unauthorized.out" >&2
+    fail "$profile: the unauthorized client failed, but not at the TLS handshake"
+  fi
+  note "refused at the handshake, as it should be:"
   sed 's/^/    /' "$WORK/unauthorized.out"
 
   stop_server

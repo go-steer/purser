@@ -145,7 +145,11 @@ func TestAuthenticatePassesTheCallerThrough(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, Path, nil)
 	// A header claiming a different source must not be believed: the
 	// auth source is stamped by the code that verified the connection.
-	req.Header.Set("X-Auth-Source", "oidc")
+	// "oidc" is a real purser.AuthSource and is not the one the
+	// authenticator reports, so an Authenticate that ever read this
+	// header would fail the gotSource assertion below rather than
+	// quietly agree with it.
+	req.Header.Set("X-Auth-Source", string(purser.AuthSourceOIDC))
 	Authenticate(auth, discardLogger(), next).ServeHTTP(httptest.NewRecorder(), req)
 
 	if !ran {

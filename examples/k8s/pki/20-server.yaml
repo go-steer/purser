@@ -51,13 +51,6 @@ spec:
     metadata:
       labels:
         app: hello-server
-      annotations:
-        # Roll the pods when the certificate is reissued. Without this
-        # the kubelet still refreshes the mounted Secret, but only on
-        # its sync period, and the process holds the old key pair in
-        # memory until it restarts — purser's PKI profile reads the
-        # certificate once, at construction.
-        purser.dev/tls-secret: hello-server-tls
     spec:
       serviceAccountName: hello-server
       securityContext:
@@ -85,6 +78,15 @@ spec:
             - -admin-addr=0.0.0.0:8080
             # cert-manager's Secret keys. ca.crt is the issuing CA, so
             # it is what the peer must chain to.
+            #
+            # Nothing rolls this pod when the certificate is renewed:
+            # cert-manager rewrites the Secret, the kubelet refreshes the
+            # mount on its sync period, and no controller here watches
+            # either. That is fine because the process re-reads the files
+            # (purser's PKIOptions.GetCertificate, see -pki-reload), and
+            # it is the reason it has to. Renewal is 30 days before a
+            # 90-day expiry, so a pod pinned to its first leaf would look
+            # healthy for two months and then stop.
             - -pki-cert=/etc/purser/tls/tls.crt
             - -pki-key=/etc/purser/tls/tls.key
             - -pki-peer-ca=/etc/purser/tls/ca.crt

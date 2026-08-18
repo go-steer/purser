@@ -66,6 +66,16 @@ func run(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	// A negative count would make the loop below run zero times and the
+	// process exit 0 without ever dialling anything. Harmless-looking,
+	// and exactly the kind of thing a smoke test cannot see: a green
+	// exit status that proves nothing.
+	if *count < 0 {
+		return fmt.Errorf("-count must be 0 (forever) or positive, got %d", *count)
+	}
+	if *retries < 0 {
+		return fmt.Errorf("-retries must not be negative, got %d", *retries)
+	}
 
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
 

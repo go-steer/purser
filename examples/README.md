@@ -45,14 +45,18 @@ valid, current, and issued by the same CA — it is refused because the
 server admits one named peer and this is not it. A demo where every
 credential works only demonstrates that TLS is switched on.
 
-The two are refused at different layers, and the distinction is the
-library's central one:
+The refusal happens at the handshake, and *which* layer it happens at
+is the library's central distinction:
 
 - **Admission** (layer A) happens during the handshake. A refused peer
   never reaches `net/http`, so no handler runs and nothing is logged at
-  the application layer. This is `-pki-admit-ou` / `-spiffe-admit-id`.
+  the application layer. This is `-pki-admit-ou` / `-spiffe-admit-id`,
+  and it is what turns the second client away in every cell.
 - **Identity** (layer B) is extracted from every admitted connection,
-  unconditionally, and is what the handler reads off the context.
+  unconditionally, and is what the handler reads off the context. It
+  never rejects anything; an unrecognized-but-admitted peer still gets
+  a `Caller`, and deciding what that caller may *do* is the consuming
+  service's job, not purser's.
 
 ## The programs
 
@@ -138,9 +142,10 @@ Shared, from `internal/profile`:
 | `-pki-peer-ca` | anchors the peer's certificate must chain to |
 | `-pki-subject` | where the caller's name comes from: `san_dns`, `san_uri`, `san_email`, `subject_cn`, `subject_dn` |
 | `-pki-admit-ou` | *server*: admit only peers with this OU |
+| `-pki-reload` | how often to re-read the certificate and key; `0` means 30s, negative pins them |
 | `-spiffe-dir` | directory holding `certificates.pem`, `private_key.pem`, `ca_certificates.pem` |
 | `-spiffe-trust-domain` | e.g. `example.org` |
-| `-spiffe-reload` | how often to re-read those files; 0 disables |
+| `-spiffe-reload` | how often to re-read those files; `0` means 30s, negative disables reloading |
 | `-spiffe-admit-id` | *server*: admit this SPIFFE ID (repeatable) |
 | `-spiffe-admit-gke` | *server*: admit `PROJECT/NAMESPACE/SERVICEACCOUNT` (repeatable) |
 | `-spiffe-authorize-id` | *client*: the server ID to accept (repeatable) |

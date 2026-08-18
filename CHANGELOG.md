@@ -186,11 +186,15 @@ in [`CONTRIBUTING.md`](./CONTRIBUTING.md).
   `smoke` presubmit — the seam the unit suite cannot reach, two processes
   talking over a real socket. The SPIRE and GKE cells share one code path
   because both read credentials from files: a spiffe-helper sidecar writes the
-  three GKE file names into a memory-backed volume, so the GKE manifest is the
-  SPIRE one with the sidecar deleted. `workloadapi.X509Source` is deliberately
-  not used — GKE managed workload identity publishes no Workload API socket to
-  dial, and it would pull gRPC and protobuf into the module graph of a library
-  many services depend on.
+  three GKE file names into a memory-backed volume, so the Go code is identical
+  and only the plumbing around it moves. `workloadapi.X509Source` is
+  deliberately not used — GKE managed workload identity publishes no Workload
+  API socket to dial, and it would pull gRPC and protobuf into the module graph
+  of a library many services depend on. The PKI cells re-read their leaf
+  through `PKIOptions.GetCertificate` on a `-pki-reload` interval rather than
+  loading it once: cert-manager renews 30 days before a 90-day expiry and
+  nothing rolls the pod, so a pinned certificate looks healthy for two months
+  and then stops.
 
 ### Changed
 - `authtest.CA` is now a thin wrapper over an internal, error-returning CA core
