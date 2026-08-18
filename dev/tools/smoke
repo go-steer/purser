@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Run the end-to-end example under both mTLS profiles.
+#
+# The unit suite covers the library and the example's own packages. This
+# covers the seam between them: real processes, real sockets, real
+# handshakes, and the flags a human actually types. It is deliberately
+# the same script the README tells a reader to run, so a broken demo
+# fails CI rather than a reader's first five minutes.
+#
+# Needs no network and no credentials — the demo mints its own into a
+# temporary directory.
+set -euo pipefail
+. "$(dirname "$0")/common.sh"
+cd "$(repo_root)"
+
+exec examples/local/demo both

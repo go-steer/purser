@@ -1,0 +1,220 @@
+#!/usr/bin/env bash
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Run the hello-world example end to end on this machine.
+#
+# For each profile it mints throwaway credentials, starts hello-server on
+# a loopback port, and makes two calls:
+#
+#   1. the authorized client, which must succeed and be named correctly
+#   2. the unauthorized client, which must be refused
+#
+# The second call is the half that matters. A demo where every
+# credential works only shows that TLS is on.
+#
+# Everything lands in a temporary directory that is removed on exit.
+# Nothing here needs root, a network, or any infrastructure.
+#
+# Usage:
+#   examples/local/demo              # both profiles
+#   examples/local/demo pki
+#   examples/local/demo spiffe
+set -euo pipefail
+
+repo_root() { git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel; }
+cd "$(repo_root)"
+
+readonly TRUST_DOMAIN="example.org"
+readonly SERVER_ID="spiffe://${TRUST_DOMAIN}/ns/default/sa/hello-server"
+readonly CLIENT_ID="spiffe://${TRUST_DOMAIN}/ns/default/sa/hello-client"
+readonly ADMIT_OU="platform"
+
+profiles=("pki" "spiffe")
+case "${1:-both}" in
+  both) ;;
+  pki) profiles=("pki") ;;
+  spiffe) profiles=("spiffe") ;;
+  -h | --help)
+    echo "Usage: examples/local/demo [pki|spiffe|both]"
+    exit 0
+    ;;
+  *)
+    echo "Unknown profile: $1 (want pki, spiffe or both)" >&2
+    exit 2
+    ;;
+esac
+
+WORK="$(mktemp -d)"
+SERVER_PID=""
+
+cleanup() {
+  if [[ -n "$SERVER_PID" ]] && kill -0 "$SERVER_PID" 2>/dev/null; then
+    kill "$SERVER_PID" 2>/dev/null || true
+    wait "$SERVER_PID" 2>/dev/null || true
+  fi
+  rm -rf "$WORK"
+}
+trap cleanup EXIT
+
+say() { printf '\n\033[1m▸ %s\033[0m\n' "$*"; }
+note() { printf '  %s\n' "$*"; }
+fail() {
+  printf '\033[31m✗ %s\033[0m\n' "$*" >&2
+  exit 1
+}
+
+say "building the example binaries"
+BIN="$WORK/bin"
+mkdir -p "$BIN"
+go build -o "$BIN/" ./examples/cmd/...
+note "$BIN"
+
+# start_server <log-file> <flags...>
+#
+# Starts hello-server on an ephemeral port and echoes the address it
+# actually bound. -addr-file is written after the socket is bound, so a
+# client that dials the instant it appears is queued rather than
+# refused — there is no sleep here and no race.
+start_server() {
+  local log="$1"
+  shift
+  local addr_file="$WORK/addr"
+  rm -f "$addr_file"
+
+  "$BIN/hello-server" \
+    -addr "127.0.0.1:0" \
+    -addr-file "$addr_file" \
+    -admin-addr "127.0.0.1:0" \
+    -name "local-demo" \
+    "$@" >"$log" 2>&1 &
+  SERVER_PID=$!
+
+  local waited=0
+  while [[ ! -s "$addr_file" ]]; do
+    if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+      cat "$log" >&2
+      fail "hello-server exited before it bound a port"
+    fi
+    sleep 0.05
+    waited=$((waited + 1))
+    if [[ "$waited" -gt 200 ]]; then # 10s
+      cat "$log" >&2
+      fail "hello-server did not bind a port within 10s"
+    fi
+  done
+  cat "$addr_file"
+}
+
+stop_server() {
+  if [[ -n "$SERVER_PID" ]]; then
+    kill "$SERVER_PID" 2>/dev/null || true
+    wait "$SERVER_PID" 2>/dev/null || true
+    SERVER_PID=""
+  fi
+}
+
+run_profile() {
+  local profile="$1"
+  local creds="$WORK/$profile"
+  local log="$WORK/$profile-server.log"
+
+  say "profile: $profile"
+
+  "$BIN/mint-credentials" -dir "$creds" -profile "$profile" | sed 's/^/  /'
+
+  local server_flags=() authorized_flags=() unauthorized_flags=()
+  case "$profile" in
+    pki)
+      server_flags=(
+        -profile pki
+        -pki-cert "$creds/server/cert.pem"
+        -pki-key "$creds/server/key.pem"
+        -pki-peer-ca "$creds/server/ca.pem"
+        -pki-admit-ou "$ADMIT_OU"
+      )
+      authorized_flags=(
+        -profile pki
+        -pki-cert "$creds/client/cert.pem"
+        -pki-key "$creds/client/key.pem"
+        -pki-peer-ca "$creds/client/ca.pem"
+      )
+      unauthorized_flags=(
+        -profile pki
+        -pki-cert "$creds/unauthorized/cert.pem"
+        -pki-key "$creds/unauthorized/key.pem"
+        -pki-peer-ca "$creds/unauthorized/ca.pem"
+      )
+      ;;
+    spiffe)
+      server_flags=(
+        -profile spiffe
+        -spiffe-dir "$creds/server"
+        -spiffe-trust-domain "$TRUST_DOMAIN"
+        -spiffe-admit-id "$CLIENT_ID"
+      )
+      authorized_flags=(
+        -profile spiffe
+        -spiffe-dir "$creds/client"
+        -spiffe-trust-domain "$TRUST_DOMAIN"
+        -spiffe-authorize-id "$SERVER_ID"
+      )
+      unauthorized_flags=(
+        -profile spiffe
+        -spiffe-dir "$creds/unauthorized"
+        -spiffe-trust-domain "$TRUST_DOMAIN"
+        -spiffe-authorize-id "$SERVER_ID"
+      )
+      ;;
+  esac
+
+  local addr
+  addr="$(start_server "$log" "${server_flags[@]}")"
+  note "hello-server listening on https://$addr"
+
+  say "$profile: the authorized client"
+  # Retries cover the gap between bind and accept on a cold process.
+  if ! "$BIN/hello-client" \
+    -url "https://$addr" \
+    -count 1 -retries 10 -retry-delay 200ms \
+    "${authorized_flags[@]}" | sed 's/^/  /'; then
+    cat "$log" >&2
+    stop_server
+    fail "$profile: the authorized client was refused"
+  fi
+
+  say "$profile: the unauthorized client (this one must fail)"
+  # No retries: the expected outcome is a refusal, and retrying a
+  # refusal just makes the demo slower.
+  if "$BIN/hello-client" \
+    -url "https://$addr" \
+    -count 1 -retries 0 \
+    "${unauthorized_flags[@]}" >"$WORK/unauthorized.out" 2>&1; then
+    cat "$WORK/unauthorized.out" >&2
+    stop_server
+    fail "$profile: the unauthorized client got in"
+  fi
+  note "refused, as it should be:"
+  sed 's/^/    /' "$WORK/unauthorized.out"
+
+  stop_server
+  printf '\n\033[32m✓ %s\033[0m\n' "$profile: authorized in, unauthorized out"
+}
+
+for profile in "${profiles[@]}"; do
+  run_profile "$profile"
+done
+
+echo
+echo "✓ demo complete"

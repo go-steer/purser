@@ -29,8 +29,10 @@ Scope:
   excluded). Deliberately not a hardcoded package list: this is a
   library whose package set grows, and a list would silently stop
   covering new directories.
-- Shell scripts under dev/tools/ and dev/ci/presubmits/
-- YAML: .github/workflows/*.yml, dev/tools/.golangci.yml
+- Shell scripts under dev/tools/, dev/ci/presubmits/ and examples/local/
+- YAML: .github/workflows/*.yml, dev/tools/.golangci.yml, and every
+  manifest under examples/ (recursively — the example tree grows a
+  directory per deployment target)
 - Python: dev/tools/add-license-headers (this file)
 
 For Go files, golangci-lint's `goheader` linter enforces the full
@@ -160,8 +162,9 @@ def main() -> None:
             counts["go"] += 1
             print(f"go:   {path.relative_to(REPO_ROOT)}")
 
-    # Shell: dev/tools + dev/ci/presubmits. Skip helper data files.
-    for d in (REPO_ROOT / "dev/tools", REPO_ROOT / "dev/ci/presubmits"):
+    # Shell: dev/tools + dev/ci/presubmits + the example runners.
+    # Skip helper data files.
+    for d in (REPO_ROOT / "dev/tools", REPO_ROOT / "dev/ci/presubmits", REPO_ROOT / "examples/local"):
         if not d.exists():
             continue
         for path in d.iterdir():
@@ -176,10 +179,15 @@ def main() -> None:
                     counts["sh"] += 1
                     print(f"sh:   {path.relative_to(REPO_ROOT)}")
 
-    # YAML: workflows + golangci-lint config.
+    # YAML: workflows, golangci-lint config, and the example manifests.
+    # The example tree is globbed rather than listed: it grows a
+    # directory per deployment target, and a list would silently stop
+    # covering the new one.
     yaml_files = [
         *sorted((REPO_ROOT / ".github/workflows").glob("*.yml")),
         REPO_ROOT / "dev/tools/.golangci.yml",
+        *sorted((REPO_ROOT / "examples").rglob("*.yaml")),
+        *sorted((REPO_ROOT / "examples").rglob("*.yml")),
     ]
     for path in yaml_files:
         if not path.exists():
