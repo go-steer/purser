@@ -1,0 +1,20 @@
+# Build context for examples/Dockerfile, which is built from the
+# repository root. Everything the build needs is Go source and go.mod;
+# the rest is history, tooling and agent-session state that would only
+# slow the context upload and bust the layer cache on every commit.
+.git
+.gitignore
+.github
+.claude
+CLAUDE.md
+
+bin/
+dist/
+*.test
+*.out
+coverage.*
+
+.idea/
+.vscode/
+*.swp
+.DS_Store
