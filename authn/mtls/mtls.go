@@ -73,6 +73,7 @@ import (
 	"net/http"
 
 	"github.com/go-steer/purser"
+	"github.com/go-steer/purser/internal/tlsfloor"
 )
 
 // Label keys set on the Caller resolved from a client certificate.
@@ -94,21 +95,6 @@ const (
 	LabelNotAfter = "cert.not_after"
 )
 
-// minTLSVersion is the floor a configured MinVersion may not go below.
-// TLS 1.1 and below have no secure cipher suites left and crypto/tls
-// will not negotiate them by default; accepting a request to use one
-// would be a promise this package cannot keep.
-const minTLSVersion = tls.VersionTLS12
-
-// defaultTLSVersion is the floor when MinVersion is unset.
-//
-// core-agent's server configures TLS 1.2 today; purser raises the
-// default because every first-party client speaks 1.3, and a deployment
-// that genuinely needs 1.2 for an older client can ask for it
-// explicitly. That is the direction the mistake should point: an
-// operator who says nothing gets the stronger setting.
-const defaultTLSVersion = tls.VersionTLS13
-
 // connectionState returns the request's TLS state.
 //
 // A nil r.TLS means the request did not arrive over TLS at all — a
@@ -123,14 +109,12 @@ func connectionState(r *http.Request) (*tls.ConnectionState, error) {
 	return r.TLS, nil
 }
 
-// resolveMinVersion validates a configured TLS floor.
+// resolveMinVersion validates a configured TLS floor. The policy is
+// shared with the client package so the two halves cannot drift.
 func resolveMinVersion(v uint16) (uint16, error) {
-	if v == 0 {
-		return defaultTLSVersion, nil
+	out, err := tlsfloor.Resolve(v)
+	if err != nil {
+		return 0, fmt.Errorf("purser/mtls: %w", err)
 	}
-	if v < minTLSVersion {
-		return 0, fmt.Errorf("purser/mtls: MinVersion %#04x is below TLS 1.2 (%#04x), which has no "+
-			"secure configuration left", v, uint16(minTLSVersion))
-	}
-	return v, nil
+	return out, nil
 }
