@@ -196,6 +196,66 @@ in [`CONTRIBUTING.md`](./CONTRIBUTING.md).
   nothing rolls the pod, so a pinned certificate looks healthy for two months
   and then stops.
 
+- `httpmw`: the HTTP layer, stdlib-only, lifted from core-agent's `pkg/attach`
+  with core-agent's own tests ported as the evidence the behavior survived.
+  `NewCaller` returns a `*CallerMiddleware` that resolves the Caller onto the
+  request context and stamps the auth-source verdict from the authenticator's
+  `Source()` — never from `tls.ConnectionState.VerifiedChains`, which is
+  populated under the PKI profile and empty under a perfectly good SPIFFE
+  connection, so the check it replaces reported `anonymous` for a caller whose
+  SVID had just been verified. A proxy assertion is refused rather than ignored
+  when the request did not authenticate, the authenticator cannot proxy, will
+  not proxy for this caller, or has no such identity provisioned; silently
+  dropping it leaves an operator whose allowlist change did nothing believing
+  it took effect. The unauthenticated case is the middleware's to catch and not
+  the authenticator's: on the non-enforcing path the Caller handed to
+  `CanProxyAs` is the *fallback*, an ordinary non-zero Caller, so
+  `AuthenticatorWithProxy`'s "must return false for the zero Caller" guard
+  never fires. `Enforce` alongside a fallback, a nil authenticator, or an
+  authenticator reporting `GatesCredentials() == false` is refused at
+  construction, because at runtime each is indistinguishable from a working
+  enforced surface.
+- `httpmw.NewBrowserWriteGuard`: the browser cross-site request forgery guard —
+  an Origin check and a `Content-Type: application/json` requirement on every
+  state-changing method. A page the operator visits can fire a CORS simple
+  request at a listener it cannot otherwise reach; the response stays
+  unreadable, which does not help, because the side effect has already landed.
+  `AllowedOrigins` is an exact-match allowlist with no wildcard and no suffix
+  match: `*.example.com` is one subdomain takeover away from being an open
+  door. An `Origin` or allowlist entry carrying userinfo is refused, because
+  `https://evil.example.com@app.example.com` parses with a host of
+  `app.example.com` and would otherwise register as — or match — a host nobody
+  meant to name. What the guard does *not* stop is DNS rebinding, which the
+  doc comment now says plainly: the self-origin rule compares against the
+  request's own Host, and closing that needs a Host allowlist belonging to the
+  service that knows its own names.
+- `httpmw.NewTokenGate` and `httpmw.ReadOnly`: the shared transport token and
+  the listener-wide write switch. A request the gate admits carries
+  `AuthSourceBearer` on its context, so a caller middleware further in whose
+  authenticator verified nothing itself still reports how the request got in —
+  inheritance from the code that did the work, replacing core-agent's
+  `transportBearerConfigured` config sniff.
+- `httpmw.CheckBind`, `httpmw.Gate` and `httpmw.IsLoopback`: the bind policy,
+  which asks a gate whether credentials are enforced instead of inspecting a
+  config field. The check it replaces keyed off `ClientCAFile != ""`, and no CA
+  file exists under SPIFFE — so a working mutually authenticated listener was
+  refused as unauthenticated. The gate to hand it is the `*CallerMiddleware`,
+  not the authenticator: a bearer table reports `GatesCredentials() == true`
+  and is telling the truth about itself, while the surface in front of it
+  admits every anonymous request unless `Enforce` is set. Enforcement is
+  therefore the middleware's own property, which also means an authenticator
+  that does not implement `authn.CredentialGate` — a future OIDC one — yields a
+  surface the policy can still approve.
+- `authn.HeaderAttachToken`, the side-channel token header, defined in the one
+  package both `authn/bearer` and `httpmw` must import so the two cannot drift
+  onto different spellings of the same credential.
+  `bearer.HeaderAttachToken` is unchanged and now an alias for it.
+- `authn.IdentityLookup` now carries the same no-aliasing clause as
+  `Authenticate`: the Caller it returns is handed to a handler, so its `Labels`
+  must not alias the authenticator's table. `httpmw` clones it regardless — the
+  cost of one implementation getting it wrong is a request's mutation
+  rewriting a provisioned identity for every request after it.
+
 ### Changed
 - `authtest.CA` is now a thin wrapper over an internal, error-returning CA core
   (`internal/ca`), so example binaries and local development commands can mint

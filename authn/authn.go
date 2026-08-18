@@ -94,6 +94,13 @@ type IdentityLookup interface {
 	// LookupIdentity returns the Caller provisioned under identity.
 	// ok is false when the identity is not provisioned, and must be
 	// false for the empty string.
+	//
+	// As with Authenticate, the returned Caller's Labels must not
+	// alias state the authenticator retains — return
+	// purser.Caller.Clone. The result is handed to a handler, and a
+	// handler that adds a label to what it believes is its own copy
+	// would otherwise rewrite the provisioned identity for every later
+	// request.
 	LookupIdentity(identity string) (purser.Caller, bool)
 }
 
@@ -109,6 +116,14 @@ type IdentityLookup interface {
 // absent under SPIFFE — a working mTLS listener that the check would
 // refuse as unauthenticated. An authenticator knows what it enforces;
 // a config field only knows how it was spelled.
+//
+// It answers for the authenticator and not for the surface. Whether a
+// request this authenticator rejects still reaches the handler is the
+// middleware's decision — httpmw.CallerOptions.Enforce — so a bind
+// policy asks the middleware, which reports this only when it is
+// actually enforcing. See httpmw.CallerMiddleware.GatesCredentials.
+// The distinction does not arise for a profile enforced at the
+// transport, where the handshake has already refused the connection.
 //
 // Authenticators that do not implement this interface are treated as
 // not gating credentials, which is the conservative reading.
@@ -126,3 +141,14 @@ type CredentialGate interface {
 // Caller uses to assert the effective identity. Surfaces may make the
 // name configurable; this is the default.
 const HeaderAssertedCaller = "X-Asserted-Caller"
+
+// HeaderAttachToken is the conventional side-channel header a token
+// may be presented in, checked before Authorization. It exists for
+// deployments where an identity gateway — Cloud Run IAM, IAP,
+// Cloudflare Access — owns the Authorization header for its own
+// validation and the service still needs a channel of its own.
+//
+// It lives here, in the package neither the token table nor the
+// middleware can avoid importing, so that authn/bearer and httpmw
+// cannot drift onto two different spellings of the same header.
+const HeaderAttachToken = "X-Attach-Token" //nolint:gosec // G101: a header name, not a credential
