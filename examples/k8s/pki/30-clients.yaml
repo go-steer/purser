@@ -1,0 +1,173 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Two clients, identical but for the certificate they mount.
+#
+#   hello-client   holds OU=platform  and is served
+#   hello-intruder holds OU=interns   and is refused at the handshake
+#
+# Watch both:
+#   kubectl -n purser-example-pki logs -f deploy/hello-client
+#   kubectl -n purser-example-pki logs -f deploy/hello-intruder
+#
+# The second is the interesting one. Its certificate is signed by the
+# same CA and is valid in every way; it is turned away because of a
+# field, by a check the server makes before any handler runs.
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: hello-client
+  namespace: purser-example-pki
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hello-client
+  namespace: purser-example-pki
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: hello-client
+  template:
+    metadata:
+      labels:
+        app: hello-client
+    spec:
+      serviceAccountName: hello-client
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: hello-client
+          image: purser-examples:latest
+          imagePullPolicy: IfNotPresent
+          command: ["/hello-client"]
+          args:
+            - -profile=pki
+            - -url=https://hello-server.purser-example-pki.svc:8443
+            # Forever, one call every ten seconds, so the log is a live
+            # view of whether mutual TLS is working.
+            - -count=0
+            - -interval=10s
+            # A client pod routinely starts before its server's
+            # endpoints are ready. Retry rather than crash-loop.
+            - -retries=30
+            - -retry-delay=2s
+            # Re-read as cert-manager renews them, on the -pki-reload
+            # interval. Nothing restarts this pod when the Secret
+            # changes, so a process that loaded them once would present
+            # an expired certificate 90 days in.
+            - -pki-cert=/etc/purser/tls/tls.crt
+            - -pki-key=/etc/purser/tls/tls.key
+            # The client verifies the server against the same CA. This
+            # is not the system trust store: an internal service chains
+            # to the internal CA, and starting from the public roots
+            # would trust every CA a browser does.
+            - -pki-peer-ca=/etc/purser/tls/ca.crt
+          volumeMounts:
+            - name: tls
+              mountPath: /etc/purser/tls
+              readOnly: true
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+      volumes:
+        - name: tls
+          secret:
+            secretName: hello-client-tls
+            defaultMode: 0440
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: hello-intruder
+  namespace: purser-example-pki
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hello-intruder
+  namespace: purser-example-pki
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: hello-intruder
+  template:
+    metadata:
+      labels:
+        app: hello-intruder
+    spec:
+      serviceAccountName: hello-intruder
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: hello-intruder
+          image: purser-examples:latest
+          imagePullPolicy: IfNotPresent
+          command: ["/hello-client"]
+          args:
+            - -profile=pki
+            - -url=https://hello-server.purser-example-pki.svc:8443
+            - -count=0
+            - -interval=10s
+            # No retries. The refusal is the expected result, and
+            # retrying it only fills the log slower.
+            - -retries=0
+            - -pki-cert=/etc/purser/tls/tls.crt
+            - -pki-key=/etc/purser/tls/tls.key
+            - -pki-peer-ca=/etc/purser/tls/ca.crt
+          volumeMounts:
+            - name: tls
+              mountPath: /etc/purser/tls
+              readOnly: true
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+      volumes:
+        - name: tls
+          secret:
+            secretName: hello-intruder-tls
+            defaultMode: 0440

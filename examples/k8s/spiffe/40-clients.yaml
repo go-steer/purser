@@ -1,0 +1,262 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Two clients with genuine, valid SVIDs from the same SPIRE server.
+#
+#   hello-client   .../sa/hello-client   is served
+#   hello-intruder .../sa/hello-intruder is refused at the handshake
+#
+#   kubectl -n purser-example-spiffe logs -f deploy/hello-client
+#   kubectl -n purser-example-spiffe logs -f deploy/hello-intruder
+#
+# Nothing is wrong with the intruder's credential. It is current, it
+# chains to the trust bundle, and the server would verify it happily.
+# It is refused because the server admits one named ID and this is not
+# it. Membership in a trust domain is not authorization.
+#
+# Both are also given -spiffe-authorize-id. A SPIFFE client verifies
+# with InsecureSkipVerify set and go-spiffe checking the peer ID, so no
+# hostname is checked anywhere: without naming the server, a client
+# would accept any workload in the trust domain that answered the
+# Service address.
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: hello-client
+  namespace: purser-example-spiffe
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hello-client
+  namespace: purser-example-spiffe
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: hello-client
+  template:
+    metadata:
+      labels:
+        app: hello-client
+    spec:
+      serviceAccountName: hello-client
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        - name: spiffe-helper
+          image: ghcr.io/spiffe/spiffe-helper:0.11.0
+          restartPolicy: Always
+          args: ["-config", "/etc/spiffe-helper/helper.conf"]
+          startupProbe:
+            httpGet:
+              path: /ready
+              port: 8081
+            periodSeconds: 2
+            failureThreshold: 60
+          livenessProbe:
+            httpGet:
+              path: /live
+              port: 8081
+            periodSeconds: 30
+          volumeMounts:
+            - name: spiffe-workload-api
+              mountPath: /spiffe-workload-api
+              readOnly: true
+            - name: spiffe-helper-config
+              mountPath: /etc/spiffe-helper
+              readOnly: true
+            - name: svids
+              mountPath: /var/run/secrets/workload-spiffe-credentials
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+      containers:
+        - name: hello-client
+          image: purser-examples:latest
+          imagePullPolicy: IfNotPresent
+          command: ["/hello-client"]
+          args:
+            - -profile=spiffe
+            - -url=https://hello-server.purser-example-spiffe.svc:8443
+            - -count=0
+            - -interval=10s
+            - -retries=30
+            - -retry-delay=2s
+            - -spiffe-dir=/var/run/secrets/workload-spiffe-credentials
+            - -spiffe-trust-domain=$(TRUST_DOMAIN)
+            - -spiffe-authorize-id=spiffe://$(TRUST_DOMAIN)/ns/purser-example-spiffe/sa/hello-server
+          env:
+            - name: TRUST_DOMAIN
+              valueFrom:
+                configMapKeyRef:
+                  name: purser-example
+                  key: trust_domain
+          volumeMounts:
+            - name: svids
+              mountPath: /var/run/secrets/workload-spiffe-credentials
+              readOnly: true
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+      volumes:
+        - name: spiffe-workload-api
+          csi:
+            driver: csi.spiffe.io
+            readOnly: true
+        - name: spiffe-helper-config
+          configMap:
+            name: spiffe-helper
+        - name: svids
+          emptyDir:
+            medium: Memory
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: hello-intruder
+  namespace: purser-example-spiffe
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hello-intruder
+  namespace: purser-example-spiffe
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: hello-intruder
+  template:
+    metadata:
+      labels:
+        app: hello-intruder
+    spec:
+      serviceAccountName: hello-intruder
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        - name: spiffe-helper
+          image: ghcr.io/spiffe/spiffe-helper:0.11.0
+          restartPolicy: Always
+          args: ["-config", "/etc/spiffe-helper/helper.conf"]
+          startupProbe:
+            httpGet:
+              path: /ready
+              port: 8081
+            periodSeconds: 2
+            failureThreshold: 60
+          livenessProbe:
+            httpGet:
+              path: /live
+              port: 8081
+            periodSeconds: 30
+          volumeMounts:
+            - name: spiffe-workload-api
+              mountPath: /spiffe-workload-api
+              readOnly: true
+            - name: spiffe-helper-config
+              mountPath: /etc/spiffe-helper
+              readOnly: true
+            - name: svids
+              mountPath: /var/run/secrets/workload-spiffe-credentials
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+      containers:
+        - name: hello-intruder
+          image: purser-examples:latest
+          imagePullPolicy: IfNotPresent
+          command: ["/hello-client"]
+          args:
+            - -profile=spiffe
+            - -url=https://hello-server.purser-example-spiffe.svc:8443
+            - -count=0
+            - -interval=10s
+            # No retries: the refusal is the expected result.
+            - -retries=0
+            - -spiffe-dir=/var/run/secrets/workload-spiffe-credentials
+            - -spiffe-trust-domain=$(TRUST_DOMAIN)
+            - -spiffe-authorize-id=spiffe://$(TRUST_DOMAIN)/ns/purser-example-spiffe/sa/hello-server
+          env:
+            - name: TRUST_DOMAIN
+              valueFrom:
+                configMapKeyRef:
+                  name: purser-example
+                  key: trust_domain
+          volumeMounts:
+            - name: svids
+              mountPath: /var/run/secrets/workload-spiffe-credentials
+              readOnly: true
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+      volumes:
+        - name: spiffe-workload-api
+          csi:
+            driver: csi.spiffe.io
+            readOnly: true
+        - name: spiffe-helper-config
+          configMap:
+            name: spiffe-helper
+        - name: svids
+          emptyDir:
+            medium: Memory

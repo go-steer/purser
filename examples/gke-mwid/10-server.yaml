@@ -1,0 +1,155 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# The same server as examples/k8s/spiffe, deployed differently.
+#
+# GKE's managed workload identity mounts the SVID, its key and the trust
+# anchors directly, under the same three file names spiffe-helper was
+# configured to write, so the Go code does not change at all. What
+# changes is around it: the sidecar and the SPIRE agent socket are gone,
+# the emptyDir becomes a podcertificate.gke.io CSI volume, the trust
+# domain is the fleet's, the admitted peer is named with
+# -spiffe-admit-gke, and Standard clusters need a nodeSelector.
+#
+# Reading credentials from files rather than from an agent socket is
+# what keeps the code identical — and it has to be, because managed
+# workload identity publishes no Workload API socket to talk to.
+#
+# Replace the image with one you have pushed. See README.md.
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: hello-server
+  namespace: purser-example-gke
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hello-server
+  namespace: purser-example-gke
+spec:
+  selector:
+    app: hello-server
+  ports:
+    - name: https
+      port: 8443
+      targetPort: https
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hello-server
+  namespace: purser-example-gke
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: hello-server
+  template:
+    metadata:
+      labels:
+        app: hello-server
+    spec:
+      serviceAccountName: hello-server
+      # Required on Standard clusters; omit it on Autopilot, which has
+      # no unlabelled nodes to keep the pod away from.
+      nodeSelector:
+        iam.gke.io/gke-metadata-server-enabled: "true"
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: hello-server
+          image: REGION-docker.pkg.dev/PROJECT_ID/purser-examples/hello:latest
+          command: ["/hello-server"]
+          args:
+            - -profile=spiffe
+            - -addr=0.0.0.0:8443
+            - -admin-addr=0.0.0.0:8080
+            # The managed workload identity mount, which is also
+            # purser's default when -spiffe-dir is empty. Spelled out so
+            # this file and examples/k8s/spiffe/30-server.yaml can be
+            # diffed line for line.
+            - -spiffe-dir=/var/run/secrets/workload-spiffe-credentials
+            - -spiffe-trust-domain=$(PROJECT_ID).svc.id.goog
+            # -spiffe-admit-gke, not -spiffe-admit-id: the same
+            # decision, but assembled from the three parts that vary
+            # rather than from a spiffe:// string that is easy to paste
+            # slightly wrong.
+            - -spiffe-admit-gke=$(PROJECT_ID)/purser-example-gke/hello-client
+            - -name=$(POD_NAME)
+          env:
+            - name: PROJECT_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: purser-example
+                  key: project_id
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          ports:
+            - name: https
+              containerPort: 8443
+            - name: admin
+              containerPort: 8080
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: admin
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: admin
+            periodSeconds: 5
+          volumeMounts:
+            - name: fleet-spiffe-credentials
+              mountPath: /var/run/secrets/workload-spiffe-credentials
+              readOnly: true
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+      volumes:
+        # There is no sidecar in this cell because there is nothing for
+        # one to do. The mount does not succeed until the certificate
+        # has been issued, so the container does not start without a
+        # credential — the guarantee the startupProbe buys in the SPIRE
+        # cell comes for free here. On a cold pod that wait can run to
+        # several minutes.
+        - name: fleet-spiffe-credentials
+          csi:
+            driver: podcertificate.gke.io
+            volumeAttributes:
+              signerName: spiffe.gke.io/fleet-svid
+              # A fixed nickname for the fleet pool, not a placeholder:
+              # leave it exactly as written. A self-managed pool uses
+              # fleet-project/tenancy-scope instead.
+              trustDomain: fleet-project/svc.id.goog

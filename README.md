@@ -9,10 +9,11 @@ turn a TLS connection or an HTTP request into a `Caller`, and answer whether
 that caller may perform an action.
 
 > **Status: phase 1a, in progress.** The identity contract, the test harness,
-> the bearer-token table, and both mTLS profiles — standard-CA and SPIFFE — are
-> in place. OIDC, the authorization layer, the HTTP middleware, and the client
-> helpers are next, and nothing here is importable as a stable API until phase
-> 1a is complete.
+> the bearer-token table, both mTLS profiles — standard-CA and SPIFFE — and the
+> dialling half in `client` are in place, with a worked example under
+> [`examples/`](./examples/). OIDC, the authorization layer, and the HTTP
+> middleware are next, and nothing here is importable as a stable API until
+> phase 1a is complete.
 
 ## Why it exists
 
@@ -48,7 +49,24 @@ package buried in a daemon.
 | `authn` | The `Authenticator` contract and its implementations. Each credential type lands in its own subpackage. |
 | `authn/bearer` | The static token table, kept for compatibility with deployments running one today. It is the thing purser exists to replace, not the thing to reach for in a new deployment. |
 | `authn/mtls` | Caller identity from a client certificate, in two profiles: `NewPKI` for certificates from a standard CA, `NewSPIFFE` for X.509-SVIDs. Each constructor returns a `*tls.Config` and the `Authenticator` that understands the connections it admits, together — the two are one decision, and the profiles verify with opposite `crypto/tls` idioms. Also the connection-admission matchers for both, anchored so that a rule naming one namespace cannot be widened into one naming several. |
+| `client` | The dialling half of `authn/mtls`: `NewPKI` and `NewSPIFFE` return a `*tls.Config` that pairs with a listener from the matching server constructor, and `Transport` wraps one in an `http.Transport` that keeps HTTP/2. |
 | `authtest` | An in-memory CA and `RunAuthenticatorSuite`, the conformance suite every `Authenticator` — here and in consuming repos — is expected to pass. |
+
+## Example
+
+[`examples/`](./examples/) is a hello-world REST/JSON server and client
+deployed four ways — locally, on Kubernetes with cert-manager, on Kubernetes
+with SPIRE, and on GKE with managed workload identity — over both mTLS
+profiles. Every cell deploys two clients, one that is served and one holding an
+equally valid certificate that is refused during the handshake.
+
+```bash
+examples/local/demo    # no root, no network, no infrastructure
+```
+
+That script is also the `smoke` step of `dev/tools/ci`. purser itself ships no
+binary and no image; the examples are a demonstration and a test, not a
+product.
 
 ## Design
 

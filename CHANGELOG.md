@@ -172,6 +172,30 @@ in [`CONTRIBUTING.md`](./CONTRIBUTING.md).
   because PEM on disk says nothing about which trust domain it belongs to and
   the symptom of getting it wrong is a remote peer's rejection.
 
+- `examples/`: a hello-world REST/JSON server and client — service to service,
+  no human anywhere — deployed four ways over both mTLS profiles: locally, on
+  Kubernetes with cert-manager, on Kubernetes with SPIRE, and on GKE with
+  managed workload identity. Every cell deploys *two* clients, and the second
+  one holds a current certificate from the same CA and is refused during the
+  handshake: chaining to the shared internal CA, or membership in a trust
+  domain, is not an authorization decision, and a deployment that treats it as
+  one admits every workload that CA serves. `examples/local/demo` mints
+  throwaway credentials, runs both clients against a loopback listener, and
+  asserts that the authorized one got in and the other did not; it needs no
+  root, no network and no infrastructure, and it runs on every build as the new
+  `smoke` presubmit — the seam the unit suite cannot reach, two processes
+  talking over a real socket. The SPIRE and GKE cells share one code path
+  because both read credentials from files: a spiffe-helper sidecar writes the
+  three GKE file names into a memory-backed volume, so the Go code is identical
+  and only the plumbing around it moves. `workloadapi.X509Source` is
+  deliberately not used — GKE managed workload identity publishes no Workload
+  API socket to dial, and it would pull gRPC and protobuf into the module graph
+  of a library many services depend on. The PKI cells re-read their leaf
+  through `PKIOptions.GetCertificate` on a `-pki-reload` interval rather than
+  loading it once: cert-manager renews 30 days before a 90-day expiry and
+  nothing rolls the pod, so a pinned certificate looks healthy for two months
+  and then stops.
+
 ### Changed
 - `authtest.CA` is now a thin wrapper over an internal, error-returning CA core
   (`internal/ca`), so example binaries and local development commands can mint

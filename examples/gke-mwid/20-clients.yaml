@@ -1,0 +1,180 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Two clients, both holding real fleet SVIDs.
+#
+#   hello-client   .../sa/hello-client   is served
+#   hello-intruder .../sa/hello-intruder is refused at the handshake
+#
+#   kubectl -n purser-example-gke logs -f deploy/hello-client
+#   kubectl -n purser-example-gke logs -f deploy/hello-intruder
+#
+# The intruder is worth a moment. Its credential is issued by the same
+# Google-managed CA, for the same fleet, and is entirely valid. Every
+# workload in the fleet holds one like it. If the server admitted
+# anything the trust bundle verifies, it would be admitting the fleet.
+#
+# Replace the image with one you have pushed. See README.md.
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: hello-client
+  namespace: purser-example-gke
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hello-client
+  namespace: purser-example-gke
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: hello-client
+  template:
+    metadata:
+      labels:
+        app: hello-client
+    spec:
+      serviceAccountName: hello-client
+      nodeSelector:
+        iam.gke.io/gke-metadata-server-enabled: "true"
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: hello-client
+          image: REGION-docker.pkg.dev/PROJECT_ID/purser-examples/hello:latest
+          command: ["/hello-client"]
+          args:
+            - -profile=spiffe
+            - -url=https://hello-server.purser-example-gke.svc:8443
+            - -count=0
+            - -interval=10s
+            - -retries=30
+            - -retry-delay=2s
+            - -spiffe-dir=/var/run/secrets/workload-spiffe-credentials
+            - -spiffe-trust-domain=$(PROJECT_ID).svc.id.goog
+            - -spiffe-authorize-gke=$(PROJECT_ID)/purser-example-gke/hello-server
+          env:
+            - name: PROJECT_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: purser-example
+                  key: project_id
+          volumeMounts:
+            - name: fleet-spiffe-credentials
+              mountPath: /var/run/secrets/workload-spiffe-credentials
+              readOnly: true
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+      volumes:
+        - name: fleet-spiffe-credentials
+          csi:
+            driver: podcertificate.gke.io
+            volumeAttributes:
+              signerName: spiffe.gke.io/fleet-svid
+              trustDomain: fleet-project/svc.id.goog
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: hello-intruder
+  namespace: purser-example-gke
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hello-intruder
+  namespace: purser-example-gke
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: hello-intruder
+  template:
+    metadata:
+      labels:
+        app: hello-intruder
+    spec:
+      serviceAccountName: hello-intruder
+      nodeSelector:
+        iam.gke.io/gke-metadata-server-enabled: "true"
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: hello-intruder
+          image: REGION-docker.pkg.dev/PROJECT_ID/purser-examples/hello:latest
+          command: ["/hello-client"]
+          args:
+            - -profile=spiffe
+            - -url=https://hello-server.purser-example-gke.svc:8443
+            - -count=0
+            - -interval=10s
+            # No retries: the refusal is the expected result.
+            - -retries=0
+            - -spiffe-dir=/var/run/secrets/workload-spiffe-credentials
+            - -spiffe-trust-domain=$(PROJECT_ID).svc.id.goog
+            - -spiffe-authorize-gke=$(PROJECT_ID)/purser-example-gke/hello-server
+          env:
+            - name: PROJECT_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: purser-example
+                  key: project_id
+          volumeMounts:
+            - name: fleet-spiffe-credentials
+              mountPath: /var/run/secrets/workload-spiffe-credentials
+              readOnly: true
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+      volumes:
+        - name: fleet-spiffe-credentials
+          csi:
+            driver: podcertificate.gke.io
+            volumeAttributes:
+              signerName: spiffe.gke.io/fleet-svid
+              trustDomain: fleet-project/svc.id.goog
