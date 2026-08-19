@@ -10,8 +10,8 @@ that caller may perform an action.
 
 > **Status: phase 1a, in progress.** The identity contract, the test harness,
 > the bearer-token table, both mTLS profiles — standard-CA and SPIFFE — the
-> dialling half in `client`, and the HTTP middleware are in place, with a worked
-> example under [`examples/`](./examples/). The authorization layer and OIDC are
+> dialling half in `client`, the HTTP middleware, and the authorization layer
+> are in place, with a worked example under [`examples/`](./examples/). OIDC is
 > next, and nothing here is importable as a stable API until phase 1a is
 > complete.
 
@@ -50,6 +50,7 @@ package buried in a daemon.
 | `authn/bearer` | The static token table, kept for compatibility with deployments running one today. It is the thing purser exists to replace, not the thing to reach for in a new deployment. |
 | `authn/mtls` | Caller identity from a client certificate, in two profiles: `NewPKI` for certificates from a standard CA, `NewSPIFFE` for X.509-SVIDs. Each constructor returns a `*tls.Config` and the `Authenticator` that understands the connections it admits, together — the two are one decision, and the profiles verify with opposite `crypto/tls` idioms. Also the connection-admission matchers for both, anchored so that a rule naming one namespace cannot be widened into one naming several. |
 | `httpmw` | The serving half: `NewCaller` puts the `Caller` and the auth-source verdict on the request context, `NewBrowserWriteGuard` closes the browser CSRF vectors against a JSON API, `NewTokenGate` is the shared transport token, and `CheckBind` refuses to bind a network address unless something in that chain reports that it enforces credentials. Stdlib-only; it learns everything about a credential through the `authn` interfaces. |
+| `authz` | The deciding half: an `ACL` and the Admin / Owner / Contributor / Viewer matrix for one resource, plus `Rules` — named matchers over identity, email domain, SPIFFE path segments and labels that grant the `Admin` bit and the right to proxy, replacing the exact-match identity lists that scale no better than the token table. `WithRules` applies a rule set to any `Authenticator`. Stdlib-only, and it names no resource type: the vocabulary is the consuming service's. |
 | `client` | The dialling half of `authn/mtls`: `NewPKI` and `NewSPIFFE` return a `*tls.Config` that pairs with a listener from the matching server constructor, and `Transport` wraps one in an `http.Transport` that keeps HTTP/2. |
 | `authtest` | An in-memory CA and `RunAuthenticatorSuite`, the conformance suite every `Authenticator` — here and in consuming repos — is expected to pass. |
 

@@ -256,6 +256,62 @@ in [`CONTRIBUTING.md`](./CONTRIBUTING.md).
   cost of one implementation getting it wrong is a request's mutation
   rewriting a provisioned identity for every request after it.
 
+- `authz`: the per-resource authorization matrix, ported from core-agent's
+  `pkg/auth/authorize.go` cell for cell — `ACL`, `Role`, `ACL.RoleOf`, `Allows`
+  and `Authorize`, with `ActionList` always permitted so a listing filters
+  rather than 403s. The nouns are gone: core-agent's `SessionACL` and its
+  `session.read` / `daemon.admin` spellings stay in core-agent, behind a
+  wrapper, because a library that names one consumer's resource type invites
+  the next consumer to authorize its jobs against a struct called `SessionACL`.
+  Three behaviors are stricter than the code they came from: a `Caller` with an
+  empty `Identity` is `RoleNone` before the `Admin` bit is consulted, so a
+  half-initialized struct cannot own a resource whose `ACL.Owner` was never
+  populated either; an unknown `Action` denies, except to `RoleAdmin`, which is
+  defined as everything; and `Allows` range-checks its `Role`, since every
+  grant below `RoleAdmin` is a `>=` comparison and `Allows` is exported for
+  services that resolve a role their own way — an integer read back from a row
+  or a mapping table is where an out-of-range value comes from.
+- `authz.Rules`: named matchers over identity, email domain, `Caller` labels
+  and structured label paths, granting the `Admin` bit and the right to proxy
+  — the replacement for core-agent's exact-match `AdminIdentities` and
+  `ProxyIdentities`, which scale no better than the token table.
+  `MatchPathSegments` and `MatchPathPrefix` are segment-anchored and
+  `MatchEmailDomain` anchors on the last `@`, so a rule naming `/ns/prod`
+  cannot be satisfied by `/ns/production` or by `/ns/attacker/x/ns/prod/sa/y`,
+  and one naming `example.com` cannot be satisfied by `notexample.com`. The
+  domain's case is folded over ASCII only, not with `strings.EqualFold`, whose
+  Unicode simple folding makes `ſlack.com` and `slacK.com` (U+017F, U+212A)
+  equal to `slack.com` — separately registrable IDN domains. A matcher
+  assembled from configuration that never got set matches nobody, including
+  `MatchAll()` with no matchers and `MatchNot(nil)`; the consequence is that
+  the package supplies no way to spell "everyone", which a deployment that
+  means it writes in its own source. No rule grants anything to the zero
+  `Caller` or to `purser.AnonymousIdentity`, the identity an unauthenticated
+  request resolves to where anonymous access is allowed. The rule set is a
+  union with no deny rules, so its meaning does not depend on its order and
+  `Rules.Apply` never clears a grant somebody else set; exceptions are written
+  with `MatchNot`, which is only ever as wide as the comparison it is written
+  in — identities are matched byte for byte, so an exception naming one does
+  not cover a case-varied spelling of it. `Rules.Matching` reports which named
+  rules fired, which is what makes a grant answerable from an audit record.
+  Label keys are arguments rather than constants re-declared here — a rule
+  reads `MatchPathPrefix(mtls.LabelPath, "ns", "prod")` — because `authz` is
+  stdlib-only and two spellings of one key would drift.
+- `authz.WithRules`: applies a rule set to any `authn.Authenticator`. Every
+  resolved `Caller` passes through `Rules.Apply`, `CanProxyAs` is the union of
+  the rules and the authenticator's own allowlist so a migration loses nobody,
+  and an identity reached through `authn.IdentityLookup` gets the grants it
+  would have had authenticating directly. It refuses at construction an
+  authenticator reporting `purser.AuthSourceAnonymous`: applying policy to an
+  authenticator that verifies nothing would put the `Admin` bit on requests
+  that presented no credential. The returned authenticator implements exactly
+  the optional `authn` extensions the wrapped one does, plus
+  `authn.AuthenticatorWithProxy`, which rules may grant on their own and which
+  reads the same as absence when nothing permits proxying — implementing too
+  few makes `httpmw` take asserted identities at face value, and too many
+  makes it reject every assertion as unprovisioned, or accept `Enforce` over
+  an authenticator that admits everything.
+
 ### Changed
 - `authtest.CA` is now a thin wrapper over an internal, error-returning CA core
   (`internal/ca`), so example binaries and local development commands can mint
