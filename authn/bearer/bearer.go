@@ -44,7 +44,13 @@ import (
 // presented in, checked before Authorization. It exists for
 // deployments where an identity gateway owns the Authorization header
 // and the daemon needs its own channel.
-const HeaderAttachToken = "X-Attach-Token" //nolint:gosec // G101: a header name, not a credential
+//
+// It is authn.HeaderAttachToken, re-exported here so a consumer of the
+// token table need not import authn for the header name. One
+// definition: httpmw's transport gate accepts the same header, and two
+// spellings of it would be a credential that works on one path and is
+// ignored on the other.
+const HeaderAttachToken = authn.HeaderAttachToken
 
 // schemeBearer is the Authorization scheme, matched case-insensitively
 // per RFC 7235 §2.1.
