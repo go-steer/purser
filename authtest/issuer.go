@@ -22,8 +22,10 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -38,10 +40,11 @@ import (
 // test with it, or set an audience explicitly on both sides.
 const DefaultAudience = "purser.authtest/audience"
 
-// defaultSubject is the "sub" claim Mint uses when the caller supplies
+// DefaultSubject is the "sub" claim Mint uses when the caller supplies
 // none. Every token needs one — a token without "sub" is rejected — and
-// most tests do not care what it is.
-const defaultSubject = "purser.authtest/subject"
+// most tests do not care what it is. Exported so a test asserting on the
+// resolved identity does not have to repeat the literal.
+const DefaultSubject = "purser.authtest/subject"
 
 // Issuer is an OpenID Connect provider backed by an httptest server. It
 // serves a discovery document and a JWK Set, and mints tokens signed by
@@ -58,7 +61,13 @@ const defaultSubject = "purser.authtest/subject"
 type Issuer struct {
 	srv *httptest.Server
 
-	mu           sync.Mutex
+	mu sync.Mutex
+	// url is srv.URL, copied here because the handlers run on the
+	// server's goroutines and srv is assigned after they are registered.
+	// Nothing can reach a handler before the assignment, but the
+	// invariant is one line of code away from being untrue, and this
+	// costs nothing.
+	url          string
 	keys         []signingKey // published, in order; the last is current
 	minted       int          // names successive keys
 	jwksHits     int
@@ -89,6 +98,10 @@ func NewIssuer(tb testing.TB) *Issuer {
 	mux.HandleFunc("/jwks", i.serveJWKS)
 	i.srv = httptest.NewTLSServer(mux)
 	tb.Cleanup(i.srv.Close)
+
+	i.mu.Lock()
+	i.url = i.srv.URL
+	i.mu.Unlock()
 
 	i.AddKey(tb, string(jose.RS256))
 	return i
@@ -123,7 +136,7 @@ func (i *Issuer) Close() { i.srv.Close() }
 // JWKS returns the key set exactly as the endpoint serves it, for a
 // test that needs to serve a doctored version of it from somewhere
 // else. It does not count as a fetch.
-func (i *Issuer) JWKS(tb testing.TB) string {
+func (i *Issuer) JWKS(tb testing.TB) []byte {
 	tb.Helper()
 
 	i.mu.Lock()
@@ -132,7 +145,37 @@ func (i *Issuer) JWKS(tb testing.TB) string {
 	if err != nil {
 		tb.Fatalf("authtest: marshalling the key set: %v", err)
 	}
-	return string(body)
+	return body
+}
+
+// KeyID is the ID of the key Mint signs with by default: the most
+// recently added one. A test that wants to name that key in a header it
+// builds by hand needs it, and parsing the JWK Set back to find it is
+// no way to spend a test.
+func (i *Issuer) KeyID(tb testing.TB) string {
+	tb.Helper()
+	return i.currentKey(tb).id
+}
+
+// PublicKey returns the PKIX DER encoding of a published key's public
+// half. Pass "" for the current key.
+//
+// This is the material an algorithm-confusion attack signs with: the
+// whole shape of that attack is an HMAC whose secret is the verification
+// key the issuer published, so a test that fakes it with a random secret
+// is not testing the attack. See RawTokenOptions.HMACKey.
+func (i *Issuer) PublicKey(tb testing.TB, keyID string) []byte {
+	tb.Helper()
+
+	key := i.currentKey(tb)
+	if keyID != "" {
+		key = i.keyByID(tb, keyID)
+	}
+	der, err := x509.MarshalPKIXPublicKey(key.priv.Public())
+	if err != nil {
+		tb.Fatalf("authtest: marshalling the public half of %s: %v", key.id, err)
+	}
+	return der
 }
 
 // JWKSRequests reports how many times the key endpoint has been
@@ -162,10 +205,10 @@ func (i *Issuer) DiscoveryRequests() int {
 // signed have expired. Use Rotate for the abrupt version.
 func (i *Issuer) AddKey(tb testing.TB, alg string) string {
 	tb.Helper()
-	key := i.generate(tb, jose.SignatureAlgorithm(alg))
 
 	i.mu.Lock()
 	defer i.mu.Unlock()
+	key := i.generateLocked(tb, jose.SignatureAlgorithm(alg))
 	i.keys = append(i.keys, key)
 	return key.id
 }
@@ -178,12 +221,18 @@ func (i *Issuer) AddKey(tb testing.TB, alg string) string {
 // pins that a key withdrawn by the issuer eventually stops being
 // accepted here, which is a property no gradual rotation can
 // demonstrate.
+//
+// Read, generate and install happen under one lock, so two concurrent
+// rotations cannot lose one another's key.
 func (i *Issuer) Rotate(tb testing.TB) string {
 	tb.Helper()
-	key := i.generate(tb, i.currentKey(tb).alg)
 
 	i.mu.Lock()
 	defer i.mu.Unlock()
+	if len(i.keys) == 0 {
+		tb.Fatalf("authtest: the issuer has no keys")
+	}
+	key := i.generateLocked(tb, i.keys[len(i.keys)-1].alg)
 	i.keys = []signingKey{key}
 	return key.id
 }
@@ -219,8 +268,7 @@ type TokenOptions struct {
 	Expiry    time.Time
 
 	// Claims are merged into the payload last, so they override
-	// anything above. A nil value removes the claim instead of setting
-	// it to JSON null:
+	// anything above. A nil value removes the claim:
 	//
 	//	Claims: map[string]any{"exp": nil}          // no expiry at all
 	//	Claims: map[string]any{"exp": "next week"}  // wrong type
@@ -228,6 +276,12 @@ type TokenOptions struct {
 	//
 	// which is how a test reaches the malformed shapes that a
 	// well-behaved provider never emits and an attacker will.
+	//
+	// A claim set to JSON null — a different thing from a missing one,
+	// and worth its own test — is spelled with a json.RawMessage, which
+	// is copied into the payload verbatim:
+	//
+	//	Claims: map[string]any{"email_verified": json.RawMessage("null")}
 	Claims map[string]any
 
 	// KeyID names the published key to sign with. Defaults to the
@@ -242,11 +296,23 @@ type TokenOptions struct {
 // Mint returns a signed, compact-serialized token.
 func (i *Issuer) Mint(tb testing.TB, opts TokenOptions) string {
 	tb.Helper()
+	return i.sign(tb, opts, i.Claims(tb, opts))
+}
+
+// Claims returns the JSON payload Mint would sign for opts, for a test
+// that wants those claims under a header it builds itself. See
+// RawToken.
+func (i *Issuer) Claims(tb testing.TB, opts TokenOptions) []byte {
+	tb.Helper()
+
+	i.mu.Lock()
+	issuer := i.url
+	i.mu.Unlock()
 
 	now := time.Now()
 	claims := map[string]any{
-		"iss": i.srv.URL,
-		"sub": defaultSubject,
+		"iss": issuer,
+		"sub": DefaultSubject,
 		"aud": []string{DefaultAudience},
 		"iat": now.Unix(),
 		"exp": now.Add(time.Hour).Unix(),
@@ -285,7 +351,131 @@ func (i *Issuer) Mint(tb testing.TB, opts TokenOptions) string {
 	if err != nil {
 		tb.Fatalf("authtest: marshalling claims: %v", err)
 	}
-	return i.sign(tb, opts, payload)
+	return payload
+}
+
+// RawTokenOptions describes a token assembled header-first.
+//
+// Mint covers a token that should be accepted, and one malformed in its
+// claims. This covers the ones malformed in the *header* — the shapes a
+// real provider never emits, which are exactly the ones a verifier has
+// to refuse. Without it those tokens have to be built by splicing
+// base64 segments by hand, and a test that does that tends to end up
+// asserting something other than what it names.
+type RawTokenOptions struct {
+	// Payload is the JWS payload, verbatim. Issuer.Claims produces the
+	// usual one; a test can pass anything, including bytes that are not
+	// a JSON object.
+	Payload []byte
+
+	// SignWith names the published key whose private half signs.
+	// Defaults to the current key.
+	SignWith string
+
+	// UnpublishedKey signs with a fresh key of the signing key's
+	// algorithm that is not in the JWK Set.
+	UnpublishedKey bool
+
+	// Algorithm signs with this algorithm using the chosen key's
+	// material, rather than with the algorithm that key is published
+	// under. Defaults to the key's own.
+	//
+	// This is how a token gets a genuine RS256 signature from a key the
+	// JWK Set publishes as PS256 — the same key material, the padding
+	// the issuer did not sanction.
+	Algorithm string
+
+	// HMACKey signs symmetrically over these bytes instead of with a
+	// published key, for the algorithm-confusion attack. Pass
+	// Issuer.PublicKey: the attack's whole shape is an HMAC keyed by
+	// material the issuer publishes. Header must name the "kid", since
+	// there is no published key to take one from.
+	HMACKey []byte
+
+	// OmitKeyID leaves "kid" out of the header, which is legal and what
+	// a single-key provider often emits.
+	OmitKeyID bool
+
+	// Header is merged over the protected header last, so it overrides
+	// "alg", "kid" and "typ". This is where a header is made to
+	// disagree with the signature beneath it:
+	//
+	//	Header: map[string]any{"kid": other}  // names a key that did not sign
+	//	Header: map[string]any{"alg": "RS256"} // over a PS256 signature
+	//
+	// Values are set, never removed; use OmitKeyID for the one field
+	// worth omitting.
+	Header map[string]any
+
+	// Unsigned emits "alg": "none" and an empty signature segment. No
+	// key is used.
+	Unsigned bool
+}
+
+// RawToken assembles a compact JWS from the header and payload a test
+// chooses.
+func (i *Issuer) RawToken(tb testing.TB, opts RawTokenOptions) string {
+	tb.Helper()
+
+	if opts.Unsigned {
+		header := map[string]any{"alg": "none", "typ": "JWT"}
+		maps.Copy(header, opts.Header)
+		raw, err := json.Marshal(header)
+		if err != nil {
+			tb.Fatalf("authtest: marshalling the header: %v", err)
+		}
+		enc := base64.RawURLEncoding
+		return enc.EncodeToString(raw) + "." + enc.EncodeToString(opts.Payload) + "."
+	}
+
+	var signing jose.SigningKey
+	if opts.HMACKey != nil {
+		alg := jose.SignatureAlgorithm(opts.Algorithm)
+		if alg == "" {
+			alg = jose.HS256
+		}
+		signing = jose.SigningKey{Algorithm: alg, Key: opts.HMACKey}
+	} else {
+		key := i.currentKey(tb)
+		switch {
+		case opts.UnpublishedKey:
+			key = i.generateUnpublished(tb, key.alg)
+		case opts.SignWith != "":
+			key = i.keyByID(tb, opts.SignWith)
+		}
+		alg := key.alg
+		if opts.Algorithm != "" {
+			alg = jose.SignatureAlgorithm(opts.Algorithm)
+		}
+		// go-jose emits "kid" only when the JSONWebKey carries one.
+		kid := key.id
+		if opts.OmitKeyID {
+			kid = ""
+		}
+		signing = jose.SigningKey{Algorithm: alg, Key: jose.JSONWebKey{Key: key.priv, KeyID: kid}}
+	}
+
+	// ExtraHeaders are merged into the protected header before the
+	// signing input is built, so an override here is signed over rather
+	// than tacked on — which is what makes the resulting token a real
+	// one that happens to lie, instead of a corrupt one.
+	so := (&jose.SignerOptions{}).WithType("JWT")
+	for k, v := range opts.Header {
+		so = so.WithHeader(jose.HeaderKey(k), v)
+	}
+	signer, err := jose.NewSigner(signing, so)
+	if err != nil {
+		tb.Fatalf("authtest: building a signer for %s: %v", signing.Algorithm, err)
+	}
+	jws, err := signer.Sign(opts.Payload)
+	if err != nil {
+		tb.Fatalf("authtest: signing: %v", err)
+	}
+	token, err := jws.CompactSerialize()
+	if err != nil {
+		tb.Fatalf("authtest: serializing: %v", err)
+	}
+	return token
 }
 
 // sign serializes payload as a compact JWS under the selected key.
@@ -295,7 +485,7 @@ func (i *Issuer) sign(tb testing.TB, opts TokenOptions, payload []byte) string {
 	key := i.currentKey(tb)
 	switch {
 	case opts.UnpublishedKey:
-		key = i.generate(tb, key.alg)
+		key = i.generateUnpublished(tb, key.alg)
 	case opts.KeyID != "":
 		key = i.keyByID(tb, opts.KeyID)
 	}
@@ -341,16 +531,24 @@ func (i *Issuer) keyByID(tb testing.TB, id string) signingKey {
 	return signingKey{}
 }
 
-// generate makes a key of the right type for alg. The IDs are
-// sequential rather than random so a failure message names the same key
-// on every run.
-func (i *Issuer) generate(tb testing.TB, alg jose.SignatureAlgorithm) signingKey {
+// generateUnpublished makes a key that is not, and never will be, in
+// the JWK Set. It still draws an ID from the same counter, so the ID it
+// carries is one no published key has.
+func (i *Issuer) generateUnpublished(tb testing.TB, alg jose.SignatureAlgorithm) signingKey {
+	tb.Helper()
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	return i.generateLocked(tb, alg)
+}
+
+// generateLocked makes a key of the right type for alg. Callers hold
+// i.mu. The IDs are sequential rather than random so a failure message
+// names the same key on every run.
+func (i *Issuer) generateLocked(tb testing.TB, alg jose.SignatureAlgorithm) signingKey {
 	tb.Helper()
 
-	i.mu.Lock()
 	i.minted++
 	id := fmt.Sprintf("key-%d", i.minted)
-	i.mu.Unlock()
 
 	var priv crypto.Signer
 	var err error
@@ -377,6 +575,7 @@ func (i *Issuer) generate(tb testing.TB, alg jose.SignatureAlgorithm) signingKey
 func (i *Issuer) serveDiscovery(w http.ResponseWriter, r *http.Request) {
 	i.mu.Lock()
 	i.discoveryHit++
+	url := i.url
 	algs := make([]string, 0, len(i.keys))
 	for _, k := range i.keys {
 		algs = append(algs, string(k.alg))
@@ -384,8 +583,8 @@ func (i *Issuer) serveDiscovery(w http.ResponseWriter, r *http.Request) {
 	i.mu.Unlock()
 
 	writeJSON(w, r, map[string]any{
-		"issuer":                                i.srv.URL,
-		"jwks_uri":                              i.srv.URL + "/jwks",
+		"issuer":                                url,
+		"jwks_uri":                              url + "/jwks",
 		"id_token_signing_alg_values_supported": algs,
 		"response_types_supported":              []string{"id_token"},
 		"subject_types_supported":               []string{"public"},

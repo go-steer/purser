@@ -15,10 +15,15 @@
 package authtest_test
 
 import (
+	"bytes"
+	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"io"
+	"maps"
 	"net/http"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -41,7 +46,7 @@ func payloadOf(tb testing.TB, iss *authtest.Issuer, token string) map[string]any
 	tb.Helper()
 
 	var set jose.JSONWebKeySet
-	if err := json.Unmarshal([]byte(iss.JWKS(tb)), &set); err != nil {
+	if err := json.Unmarshal(iss.JWKS(tb), &set); err != nil {
 		tb.Fatalf("decoding the key set: %v", err)
 	}
 	algs := make([]jose.SignatureAlgorithm, 0, len(allAlgs))
@@ -226,7 +231,7 @@ func TestRotateWithdrawsTheOldKey(t *testing.T) {
 
 	// The old token no longer verifies against anything published.
 	var set jose.JSONWebKeySet
-	if err := json.Unmarshal([]byte(iss.JWKS(t)), &set); err != nil {
+	if err := json.Unmarshal(iss.JWKS(t), &set); err != nil {
 		t.Fatalf("decoding the key set: %v", err)
 	}
 	jws, err := jose.ParseSignedCompact(old, []jose.SignatureAlgorithm{jose.RS256})
@@ -252,7 +257,7 @@ func TestUnpublishedKey(t *testing.T) {
 		t.Errorf("the token names key %q, which is in the published set", keyIDOf(t, token))
 	}
 	var set jose.JSONWebKeySet
-	if err := json.Unmarshal([]byte(iss.JWKS(t)), &set); err != nil {
+	if err := json.Unmarshal(iss.JWKS(t), &set); err != nil {
 		t.Fatalf("decoding the key set: %v", err)
 	}
 	jws, err := jose.ParseSignedCompact(token, []jose.SignatureAlgorithm{jose.RS256})
@@ -345,7 +350,7 @@ func TestPublishedKeysArePublic(t *testing.T) {
 	iss.AddKey(t, "EdDSA")
 
 	var set jose.JSONWebKeySet
-	if err := json.Unmarshal([]byte(iss.JWKS(t)), &set); err != nil {
+	if err := json.Unmarshal(iss.JWKS(t), &set); err != nil {
 		t.Fatalf("decoding the key set: %v", err)
 	}
 	if len(set.Keys) != 3 {
@@ -385,11 +390,283 @@ func TestCloseStopsServingButKeepsMinting(t *testing.T) {
 	}
 }
 
+// TestKeyIDAndPublicKeyNameTheSigningKey pins the two accessors a test
+// needs to build a header by hand.
+func TestKeyIDAndPublicKeyNameTheSigningKey(t *testing.T) {
+	t.Parallel()
+
+	iss := authtest.NewIssuer(t)
+	first := iss.KeyID(t)
+	if got := keyIDOf(t, iss.Mint(t, authtest.TokenOptions{})); got != first {
+		t.Errorf("KeyID = %q but Mint signed with %q", first, got)
+	}
+
+	second := iss.AddKey(t, "ES256")
+	if got := iss.KeyID(t); got != second {
+		t.Errorf("KeyID = %q after AddKey, want the new key %q", got, second)
+	}
+
+	// PublicKey is the DER of the same public half the JWK Set carries,
+	// which is what makes it the right secret for an algorithm-confusion
+	// token.
+	for _, keyID := range publishedIDs(t, iss) {
+		want, err := x509.MarshalPKIXPublicKey(publishedKey(t, iss, keyID))
+		if err != nil {
+			t.Fatalf("marshalling the published key %q: %v", keyID, err)
+		}
+		if got := iss.PublicKey(t, keyID); !bytes.Equal(got, want) {
+			t.Errorf("PublicKey(%q) does not match the published key", keyID)
+		}
+	}
+	if got := iss.PublicKey(t, ""); !bytes.Equal(got, iss.PublicKey(t, second)) {
+		t.Errorf(`PublicKey("") is not the current key`)
+	}
+}
+
+// TestClaimsIsWhatMintSigns pins that the payload Claims hands back is
+// the one Mint would have signed, so a test can take those claims and
+// put its own header over them.
+func TestClaimsIsWhatMintSigns(t *testing.T) {
+	t.Parallel()
+
+	iss := authtest.NewIssuer(t)
+	opts := authtest.TokenOptions{Subject: "sub-9", Email: "someone@example.com"}
+
+	var direct map[string]any
+	if err := json.Unmarshal(iss.Claims(t, opts), &direct); err != nil {
+		t.Fatalf("decoding the claims: %v", err)
+	}
+	signed := payloadOf(t, iss, iss.Mint(t, opts))
+
+	// iat and exp are read from the clock at each call, so they differ
+	// by however long the two took.
+	for _, drifting := range []string{"iat", "exp"} {
+		if _, ok := direct[drifting]; !ok {
+			t.Errorf("Claims produced no %q", drifting)
+		}
+		delete(direct, drifting)
+		delete(signed, drifting)
+	}
+	if !maps.Equal(toStrings(t, direct), toStrings(t, signed)) {
+		t.Errorf("Claims produced\n\t%v\nbut Mint signed\n\t%v", direct, signed)
+	}
+}
+
+// toStrings renders a claims map for comparison, so a nested value
+// compares by its JSON rather than by pointer identity.
+func toStrings(tb testing.TB, claims map[string]any) map[string]string {
+	tb.Helper()
+	out := make(map[string]string, len(claims))
+	for k, v := range claims {
+		b, err := json.Marshal(v)
+		if err != nil {
+			tb.Fatalf("marshalling the %q claim: %v", k, err)
+		}
+		out[k] = string(b)
+	}
+	return out
+}
+
+// TestRawTokenBuildsHeadersThatLie pins the harness capability the
+// authenticator tests depend on: a token whose header disagrees with
+// the signature under it. If RawToken quietly produced an honest token
+// instead, every test built on it would pass while testing nothing.
+func TestRawTokenBuildsHeadersThatLie(t *testing.T) {
+	t.Parallel()
+
+	iss := authtest.NewIssuer(t)
+	first := iss.KeyID(t)
+	second := iss.AddKey(t, "RS256")
+	payload := iss.Claims(t, authtest.TokenOptions{})
+
+	t.Run("the default is an honest token", func(t *testing.T) {
+		t.Parallel()
+
+		token := iss.RawToken(t, authtest.RawTokenOptions{Payload: payload})
+		if got := keyIDOf(t, token); got != second {
+			t.Errorf("kid = %q, want the current key %q", got, second)
+		}
+		if got := headerOf(t, token)["alg"]; got != "RS256" {
+			t.Errorf("alg = %v, want RS256", got)
+		}
+		payloadOf(t, iss, token) // must verify against the published set
+	})
+
+	t.Run("a kid naming another key", func(t *testing.T) {
+		t.Parallel()
+
+		token := iss.RawToken(t, authtest.RawTokenOptions{
+			Payload:  payload,
+			SignWith: second,
+			Header:   map[string]any{"kid": first},
+		})
+		if got := keyIDOf(t, token); got != first {
+			t.Errorf("kid = %q, want the overridden %q", got, first)
+		}
+		// The signature is real, and is the second key's, so the key the
+		// header names does not verify it.
+		if verifiesUnder(t, iss, token, first) {
+			t.Errorf("the token verifies under %q, the key it falsely names", first)
+		}
+		if !verifiesUnder(t, iss, token, second) {
+			t.Errorf("the token does not verify under %q, the key that signed it", second)
+		}
+	})
+
+	t.Run("an alg the key was not published for", func(t *testing.T) {
+		t.Parallel()
+
+		// Its own issuer: AddKey moves the current key, and the sibling
+		// cases above assert on which key that is.
+		iss := authtest.NewIssuer(t)
+		ps := iss.AddKey(t, "PS256")
+		token := iss.RawToken(t, authtest.RawTokenOptions{
+			Payload:   iss.Claims(t, authtest.TokenOptions{}),
+			SignWith:  ps,
+			Algorithm: "RS256",
+		})
+		if got := headerOf(t, token)["alg"]; got != "RS256" {
+			t.Errorf("alg = %v, want the overridden RS256", got)
+		}
+		// A real RS256 signature by the key material, not a spliced one.
+		jws, err := jose.ParseSignedCompact(token, []jose.SignatureAlgorithm{jose.RS256})
+		if err != nil {
+			t.Fatalf("parsing: %v", err)
+		}
+		if _, err := jws.Verify(publishedKey(t, iss, ps)); err != nil {
+			t.Errorf("the RS256 signature does not verify under the published key material: %v", err)
+		}
+	})
+
+	t.Run("no kid at all", func(t *testing.T) {
+		t.Parallel()
+
+		token := iss.RawToken(t, authtest.RawTokenOptions{Payload: payload, OmitKeyID: true})
+		if _, present := headerOf(t, token)["kid"]; present {
+			t.Errorf("kid is present, want it omitted")
+		}
+		payloadOf(t, iss, token) // still a real signature
+	})
+
+	t.Run("alg none", func(t *testing.T) {
+		t.Parallel()
+
+		token := iss.RawToken(t, authtest.RawTokenOptions{Payload: payload, Unsigned: true})
+		if got := headerOf(t, token)["alg"]; got != "none" {
+			t.Errorf("alg = %v, want none", got)
+		}
+		if got := strings.Count(token, "."); got != 2 {
+			t.Errorf("the token has %d dots, want 2", got)
+		}
+		if !strings.HasSuffix(token, ".") {
+			t.Errorf("the signature segment is not empty: %s", token)
+		}
+	})
+
+	t.Run("an HMAC over the published key", func(t *testing.T) {
+		t.Parallel()
+
+		secret := iss.PublicKey(t, "")
+		token := iss.RawToken(t, authtest.RawTokenOptions{Payload: payload, HMACKey: secret})
+		if got := headerOf(t, token)["alg"]; got != "HS256" {
+			t.Errorf("alg = %v, want HS256", got)
+		}
+		// Keyed by the published material, which is the whole attack: a
+		// verifier that accepted HS256 could check this and it would pass.
+		jws, err := jose.ParseSignedCompact(token, []jose.SignatureAlgorithm{jose.HS256})
+		if err != nil {
+			t.Fatalf("parsing: %v", err)
+		}
+		if _, err := jws.Verify(secret); err != nil {
+			t.Errorf("the HMAC does not verify under the published key: %v", err)
+		}
+	})
+
+	t.Run("an unpublished key", func(t *testing.T) {
+		t.Parallel()
+
+		token := iss.RawToken(t, authtest.RawTokenOptions{Payload: payload, UnpublishedKey: true})
+		kid := keyIDOf(t, token)
+		if slices.Contains(publishedIDs(t, iss), kid) {
+			t.Errorf("kid %q is in the published set", kid)
+		}
+	})
+
+	t.Run("a payload that is not a JSON object", func(t *testing.T) {
+		t.Parallel()
+
+		token := iss.RawToken(t, authtest.RawTokenOptions{Payload: []byte("not json")})
+		jws, err := jose.ParseSignedCompact(token, []jose.SignatureAlgorithm{jose.RS256})
+		if err != nil {
+			t.Fatalf("parsing: %v", err)
+		}
+		got, err := jws.Verify(publishedKey(t, iss, keyIDOf(t, token)))
+		if err != nil {
+			t.Fatalf("verifying: %v", err)
+		}
+		if string(got) != "not json" {
+			t.Errorf("payload = %q, want it carried through verbatim", got)
+		}
+	})
+}
+
+// headerOf decodes a compact token's protected header without verifying
+// it, which is the only way to see a header that lies.
+func headerOf(tb testing.TB, token string) map[string]any {
+	tb.Helper()
+
+	segment, _, ok := strings.Cut(token, ".")
+	if !ok {
+		tb.Fatalf("the token has no header segment: %s", token)
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(segment)
+	if err != nil {
+		tb.Fatalf("decoding the header segment: %v", err)
+	}
+	var header map[string]any
+	if err := json.Unmarshal(raw, &header); err != nil {
+		tb.Fatalf("decoding the header: %v", err)
+	}
+	return header
+}
+
+// publishedKey is the public key the JWK Set carries under the given ID.
+func publishedKey(tb testing.TB, iss *authtest.Issuer, keyID string) any {
+	tb.Helper()
+
+	var set jose.JSONWebKeySet
+	if err := json.Unmarshal(iss.JWKS(tb), &set); err != nil {
+		tb.Fatalf("decoding the key set: %v", err)
+	}
+	i := slices.IndexFunc(set.Keys, func(k jose.JSONWebKey) bool { return k.KeyID == keyID })
+	if i < 0 {
+		tb.Fatalf("the key set does not carry %q", keyID)
+	}
+	return set.Keys[i].Key
+}
+
+// verifiesUnder reports whether the token's signature checks out under
+// the named published key.
+func verifiesUnder(tb testing.TB, iss *authtest.Issuer, token, keyID string) bool {
+	tb.Helper()
+
+	algs := make([]jose.SignatureAlgorithm, 0, len(allAlgs))
+	for _, alg := range allAlgs {
+		algs = append(algs, jose.SignatureAlgorithm(alg))
+	}
+	jws, err := jose.ParseSignedCompact(token, algs)
+	if err != nil {
+		tb.Fatalf("parsing the token: %v", err)
+	}
+	_, err = jws.Verify(publishedKey(tb, iss, keyID))
+	return err == nil
+}
+
 // publishedIDs lists the key IDs in the published set, in order.
 func publishedIDs(tb testing.TB, iss *authtest.Issuer) []string {
 	tb.Helper()
 	var set jose.JSONWebKeySet
-	if err := json.Unmarshal([]byte(iss.JWKS(tb)), &set); err != nil {
+	if err := json.Unmarshal(iss.JWKS(tb), &set); err != nil {
 		tb.Fatalf("decoding the key set: %v", err)
 	}
 	ids := make([]string, 0, len(set.Keys))
