@@ -439,10 +439,14 @@ func TestClaimsIsWhatMintSigns(t *testing.T) {
 	signed := payloadOf(t, iss, iss.Mint(t, opts))
 
 	// iat and exp are read from the clock at each call, so they differ
-	// by however long the two took.
+	// by however long the two took — compared within a tolerance rather
+	// than dropped, since dropping them would hide a Mint that signed a
+	// different expiry from the one Claims reports, which is exactly the
+	// divergence this test exists to catch.
 	for _, drifting := range []string{"iat", "exp"} {
-		if _, ok := direct[drifting]; !ok {
-			t.Errorf("Claims produced no %q", drifting)
+		a, b := seconds(t, direct, drifting), seconds(t, signed, drifting)
+		if d := a - b; d < -5 || d > 5 {
+			t.Errorf("%q is %d from Claims and %d from Mint, %ds apart", drifting, a, b, d)
 		}
 		delete(direct, drifting)
 		delete(signed, drifting)
@@ -450,6 +454,22 @@ func TestClaimsIsWhatMintSigns(t *testing.T) {
 	if !maps.Equal(toStrings(t, direct), toStrings(t, signed)) {
 		t.Errorf("Claims produced\n\t%v\nbut Mint signed\n\t%v", direct, signed)
 	}
+}
+
+// seconds reads a NumericDate claim, failing if it is absent or is not
+// a number.
+func seconds(tb testing.TB, claims map[string]any, name string) int64 {
+	tb.Helper()
+
+	v, ok := claims[name]
+	if !ok {
+		tb.Fatalf("there is no %q claim in %v", name, claims)
+	}
+	f, ok := v.(float64)
+	if !ok {
+		tb.Fatalf("the %q claim is %#v, want a number", name, v)
+	}
+	return int64(f)
 }
 
 // toStrings renders a claims map for comparison, so a nested value
@@ -483,33 +503,54 @@ func TestRawTokenBuildsHeadersThatLie(t *testing.T) {
 		t.Parallel()
 
 		token := iss.RawToken(t, authtest.RawTokenOptions{Payload: payload})
+		header := headerOf(t, token)
 		if got := keyIDOf(t, token); got != second {
 			t.Errorf("kid = %q, want the current key %q", got, second)
 		}
-		if got := headerOf(t, token)["alg"]; got != "RS256" {
+		if got := header["alg"]; got != "RS256" {
 			t.Errorf("alg = %v, want RS256", got)
 		}
+		if got := header["typ"]; got != "JWT" {
+			t.Errorf("typ = %v, want JWT", got)
+		}
 		payloadOf(t, iss, token) // must verify against the published set
+	})
+
+	t.Run("the default alg is the key's own", func(t *testing.T) {
+		t.Parallel()
+
+		// Not RS256, which is what every other case here signs with and
+		// so cannot distinguish from a hardcoded default.
+		for _, alg := range []string{"ES256", "EdDSA", "PS384"} {
+			iss := authtest.NewIssuer(t)
+			iss.AddKey(t, alg)
+			token := iss.RawToken(t, authtest.RawTokenOptions{Payload: iss.Claims(t, authtest.TokenOptions{})})
+			if got := headerOf(t, token)["alg"]; got != alg {
+				t.Errorf("alg = %v for a %s key, want %s", got, alg, alg)
+			}
+		}
 	})
 
 	t.Run("a kid naming another key", func(t *testing.T) {
 		t.Parallel()
 
+		// SignWith names the older key and the header names the newer, so
+		// neither is the one the other default would pick: the signature
+		// is wrong if SignWith is ignored, and the kid is wrong if the
+		// header override is.
 		token := iss.RawToken(t, authtest.RawTokenOptions{
 			Payload:  payload,
-			SignWith: second,
-			Header:   map[string]any{"kid": first},
+			SignWith: first,
+			Header:   map[string]any{"kid": second},
 		})
-		if got := keyIDOf(t, token); got != first {
-			t.Errorf("kid = %q, want the overridden %q", got, first)
+		if got := keyIDOf(t, token); got != second {
+			t.Errorf("kid = %q, want the overridden %q", got, second)
 		}
-		// The signature is real, and is the second key's, so the key the
-		// header names does not verify it.
-		if verifiesUnder(t, iss, token, first) {
-			t.Errorf("the token verifies under %q, the key it falsely names", first)
+		if verifiesUnder(t, iss, token, second) {
+			t.Errorf("the token verifies under %q, the key it falsely names", second)
 		}
-		if !verifiesUnder(t, iss, token, second) {
-			t.Errorf("the token does not verify under %q, the key that signed it", second)
+		if !verifiesUnder(t, iss, token, first) {
+			t.Errorf("the token does not verify under %q, the key SignWith named", first)
 		}
 	})
 
@@ -517,9 +558,12 @@ func TestRawTokenBuildsHeadersThatLie(t *testing.T) {
 		t.Parallel()
 
 		// Its own issuer: AddKey moves the current key, and the sibling
-		// cases above assert on which key that is.
+		// cases above assert on which key that is. A third key after the
+		// PS256 one, so SignWith is naming something other than whatever
+		// the default would have picked.
 		iss := authtest.NewIssuer(t)
 		ps := iss.AddKey(t, "PS256")
+		iss.AddKey(t, "ES256")
 		token := iss.RawToken(t, authtest.RawTokenOptions{
 			Payload:   iss.Claims(t, authtest.TokenOptions{}),
 			SignWith:  ps,
@@ -551,15 +595,38 @@ func TestRawTokenBuildsHeadersThatLie(t *testing.T) {
 	t.Run("alg none", func(t *testing.T) {
 		t.Parallel()
 
-		token := iss.RawToken(t, authtest.RawTokenOptions{Payload: payload, Unsigned: true})
-		if got := headerOf(t, token)["alg"]; got != "none" {
+		token := iss.RawToken(t, authtest.RawTokenOptions{
+			Payload:  payload,
+			Unsigned: true,
+			// The header is spliced rather than signed on this path, since
+			// go-jose will not sign "none" — so the override has to be
+			// pinned here separately from the signed path above.
+			Header: map[string]any{"kid": first},
+		})
+		header := headerOf(t, token)
+		if got := header["alg"]; got != "none" {
 			t.Errorf("alg = %v, want none", got)
+		}
+		if got := header["kid"]; got != first {
+			t.Errorf("kid = %v, want the overridden %q", got, first)
 		}
 		if got := strings.Count(token, "."); got != 2 {
 			t.Errorf("the token has %d dots, want 2", got)
 		}
 		if !strings.HasSuffix(token, ".") {
 			t.Errorf("the signature segment is not empty: %s", token)
+		}
+		// The claims still have to be there. A refusal test that names the
+		// algorithm but is handed "header.." would be refused for having
+		// no claims instead, and would read as passing.
+		_, rest, _ := strings.Cut(token, ".")
+		body, _, _ := strings.Cut(rest, ".")
+		got, err := base64.RawURLEncoding.DecodeString(body)
+		if err != nil {
+			t.Fatalf("decoding the payload segment: %v", err)
+		}
+		if !bytes.Equal(got, payload) {
+			t.Errorf("payload = %s, want it carried through verbatim", got)
 		}
 	})
 

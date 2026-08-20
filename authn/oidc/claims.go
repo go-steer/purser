@@ -370,11 +370,15 @@ func (d *numericDate) UnmarshalJSON(b []byte) error {
 		return fmt.Errorf("timestamp %s is not a finite number", n)
 	}
 	sec, frac := math.Modf(f)
-	// int64(sec) on an out-of-range float is implementation-defined; on
-	// amd64 it saturates to math.MinInt64, and time.Unix then wraps to
-	// an instant in the distant past. "nbf": 1e300 would read as long
-	// ago and the not-before check would pass — a fail-open on a
-	// timestamp nobody can read. Refused instead.
+	// int64(sec) on an out-of-range float is implementation-defined, and
+	// the two architectures this runs on disagree. amd64's CVTTSD2SI
+	// returns the "integer indefinite" value, math.MinInt64, whatever
+	// the sign of the input, so "nbf": 1e300 reads as an instant long
+	// past and the not-before check passes. arm64's FCVTZS saturates
+	// toward the input's sign, so the same literal reads as the far
+	// future — and there it is "exp": 1e300 that fails open, as a token
+	// that never expires. Either way a timestamp nobody can read decides
+	// the validity window. Refused instead.
 	if sec >= math.MaxInt64 || sec < math.MinInt64 {
 		return fmt.Errorf("timestamp %s is out of range", n)
 	}

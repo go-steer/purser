@@ -757,10 +757,14 @@ from it by name.
   claims at all, refused by the audience check today and by nothing at
   all if that check ever moved.
 - **A timestamp outside the range of an `int64` second.** `int64` of an
-  out-of-range float is implementation-defined; on amd64 it saturates to
-  `math.MinInt64` and `time.Unix` wraps to the distant past, so
-  `"nbf": 1e300` would read as long ago and the not-before check would
-  pass. A fail-open on a timestamp nobody can read.
+  out-of-range float is implementation-defined, and the two
+  architectures purser runs on disagree about it. amd64's `CVTTSD2SI`
+  returns the "integer indefinite" value `math.MinInt64` regardless of
+  the input's sign, so `"nbf": 1e300` reads as an instant long past and
+  the not-before check passes. arm64's `FCVTZS` genuinely saturates
+  toward the sign, so there the same literal reads as the far future and
+  it is `"exp": 1e300` that fails open, as a token that never expires.
+  Either way a timestamp nobody can read decides the validity window.
 - **An identity that is blank.** `" "` satisfies every non-empty check
   in this module, including `purser.Caller.IsZero`, and then sits in an
   ACL and an audit record as something no operator can see.
@@ -1130,10 +1134,12 @@ would build alone.
   `Mint` would have signed, to build on). Those are precisely the tokens
   the refusals above exist for, and a harness that cannot mint them
   leaves each of those tests asserting that some *other* defect was
-  caught — which is what the first draft of this package did. Signing
-  with an overridden header rather than splicing base64 segments is what
-  makes the result a real token that lies, rather than a corrupt one any
-  parser rejects.
+  caught — which is what the first draft of this package did. The header
+  is overridden and then *signed over*, rather than spliced on
+  afterwards, which is what makes the result a real token that lies
+  rather than a corrupt one any parser rejects. `alg: none` is the one
+  exception, assembled by hand because go-jose will not sign it — and
+  there the lack of a signature is the point.
 - **Golden matrix test** for `Authorize`, pinning the
   Admin / Owner / Viewer / Contributor table. It lives in
   `authz/authz_test.go` rather than in `authtest`: core-agent's grid is

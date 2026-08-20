@@ -368,12 +368,13 @@ in [`CONTRIBUTING.md`](./CONTRIBUTING.md).
   notwithstanding: such a token is a bearer credential valid forever. A payload
   that is not a JSON object is refused rather than read as an empty one, an
   `exp`/`nbf`/`iat` outside the range of an `int64` second is refused rather
-  than converted (`int64` of an out-of-range float is
-  implementation-defined — on amd64 it saturates and `time.Unix` wraps to the
-  distant past, so `"nbf": 1e300` would read as long ago), and an identity
-  resolving to whitespace is refused rather than carried, since `" "` satisfies
-  every non-empty check in the module and then sits in an ACL as something no
-  operator can see.
+  than converted (`int64` of an out-of-range float is implementation-defined:
+  amd64 returns `math.MinInt64` whatever the sign, so `"nbf": 1e300` reads as
+  long past and passes the not-before check, while arm64 saturates toward the
+  sign, so there `"exp": 1e300` reads as the far future and never expires), and
+  an identity resolving to whitespace is refused rather than carried, since
+  `" "` satisfies every non-empty check in the module and then sits in an ACL
+  as something no operator can see.
 - `authn/oidc`: every registered claim is looked up by its exact key rather
   than unmarshalled into a tagged struct. `encoding/json` falls back to a
   case-insensitive field match when no exact match exists, and of two keys that
