@@ -54,6 +54,11 @@ func TestDiscoveryRefusals(t *testing.T) {
 		wantErr  string
 	}{
 		{
+			// Neither URL is ever dialled: the issuer check refuses the
+			// document before the key endpoint is fetched, which is the
+			// property under test. ".example" is reserved by RFC 6761 §6.5
+			// and does not resolve, so a regression that reordered those
+			// two steps would fail here rather than reach the network.
 			name: "the document names another issuer",
 			document: func(self string) string {
 				return `{"issuer":"https://evil.example","jwks_uri":"https://evil.example/jwks"}`
@@ -99,7 +104,7 @@ func TestDiscoveryRefusals(t *testing.T) {
 		{
 			name:     "an error from the provider",
 			document: func(self string) string { return "" },
-			wantErr:  "500",
+			wantErr:  "500 Internal Server Error",
 		},
 	}
 

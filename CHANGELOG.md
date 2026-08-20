@@ -337,12 +337,24 @@ in [`CONTRIBUTING.md`](./CONTRIBUTING.md).
   that triggered them, so the first client to hang up does not cancel the fetch
   for everyone waiting behind it; when a fetch fails and a matching key is
   already cached, the cached key is served, because an IdP that is briefly down
-  must not log every operator out of every service.
+  must not log every operator out of every service. That last point is the
+  documented cost of `KeyRefresh`: it bounds a withdrawn key's life only while
+  fetches succeed. A panic anywhere inside a fetch — a caller-supplied
+  `Transport`, a dependency decoding hostile JWKS bytes — publishes an error to
+  the waiters and clears the single-flight slot before it propagates, since
+  `net/http` recovers per connection and a slot left occupied would park every
+  later request until its own context ended.
 - `authn/oidc`: a discovery document is followed only if it declares the issuer
   it was fetched from (RFC 8414 §3.3). Without that check, anything that can
   answer at the issuer's well-known path can point the key fetch at a JWK Set
   of its own and sign tokens for any identity. The `jwks_uri` need only be
   https — a provider's keys legitimately live on another host, as Google's do.
+  The scheme checks are backed by a redirect policy on purser's copy of the
+  HTTP client that refuses any hop to a non-https URL: `http.Client` follows up
+  to ten redirects and crosses from https to http on the way, so without it
+  those checks cover only the first URL in the chain and a `302 Location:
+  http://...` on the key endpoint gets the key set read in cleartext. A
+  `CheckRedirect` of the caller's own still runs, after that one.
 - `authn/oidc`: the refusals. Signature algorithms are an allowlist (`RS*`,
   `PS*`, `ES*`, `EdDSA`), so symmetric algorithms and `none` cannot be
   configured back in and a future go-jose addition cannot become acceptable by
@@ -353,7 +365,25 @@ in [`CONTRIBUTING.md`](./CONTRIBUTING.md).
   be empty, since the audience is the only thing distinguishing a token minted
   for this service from one minted for any other service of the same issuer. A
   token with no `exp` is refused, RFC 7519 making it optional
-  notwithstanding: such a token is a bearer credential valid forever.
+  notwithstanding: such a token is a bearer credential valid forever. A payload
+  that is not a JSON object is refused rather than read as an empty one, an
+  `exp`/`nbf`/`iat` outside the range of an `int64` second is refused rather
+  than converted (`int64` of an out-of-range float is
+  implementation-defined — on amd64 it saturates and `time.Unix` wraps to the
+  distant past, so `"nbf": 1e300` would read as long ago), and an identity
+  resolving to whitespace is refused rather than carried, since `" "` satisfies
+  every non-empty check in the module and then sits in an ACL as something no
+  operator can see.
+- `authn/oidc`: every registered claim is looked up by its exact key rather
+  than unmarshalled into a tagged struct. `encoding/json` falls back to a
+  case-insensitive field match when no exact match exists, and of two keys that
+  fold-equal the *last* one in the payload wins — so on a decoder that reads
+  the struct, an added claim named `AUD`, `EXP`, `SUB`, `ISS` or
+  `Email_Verified` overrides the real one, while the separate exact-keyed
+  decode that produces the labels reports the true value. The registered names
+  are reserved by every IdP; their case variants are reserved by none, and
+  several providers let an application append claims of its own, so the variant
+  arrives on a genuinely issuer-signed token.
 - `authn/oidc`: `Caller.Identity` is the `email` claim, falling back to `sub`,
   or whichever claim `IdentityClaim` names — with no fallback in that case,
   because a deployment that asked for one claim and silently got another would
@@ -374,6 +404,19 @@ in [`CONTRIBUTING.md`](./CONTRIBUTING.md).
   `TokenOptions.Claims` removes the claim rather than setting it to null, which
   is how a test reaches the payloads a well-behaved provider never emits and an
   attacker will.
+- `authtest.Issuer.RawToken` and `RawTokenOptions`: a token assembled
+  header-first. `Mint` covers the token that should be accepted and the one
+  malformed in its *claims*; this covers the one malformed in its *header* —
+  an `alg` the key was not published for, a `kid` naming a key that did not
+  sign it, no `kid` at all, `alg: none`, an HS256 MAC keyed by the issuer's own
+  public key, or a payload that is not JSON. Those are exactly the shapes a
+  verifier has to refuse, and without this they have to be built by splicing
+  base64 segments by hand — a test that does that tends to end up asserting
+  something other than what it names. `Claims` returns the payload `Mint` would
+  have signed, so a test can put its own header or its own extra key over it;
+  `KeyID` and `PublicKey` name and export the current signing key. `JWKS`
+  returns the served document's bytes and `DefaultSubject` is exported
+  alongside `DefaultAudience`.
 
 ### Changed
 - `authtest.CA` is now a thin wrapper over an internal, error-returning CA core

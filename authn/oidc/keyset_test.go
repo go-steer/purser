@@ -18,10 +18,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -322,42 +325,84 @@ func TestFetchOutlivesTheRequestThatTriggeredIt(t *testing.T) {
 	}
 }
 
+// unusableKeys are entries a provider legitimately publishes and this
+// package must never verify a signature against: a symmetric key —
+// which is the other half of the HS256 confusion the allowlist closes —
+// an encryption key, and a key type this build of go-jose cannot
+// represent.
+var unusableKeys = []map[string]any{
+	{"kty": "oct", "k": "c2VjcmV0LWtleS1tYXRlcmlhbA", "kid": "symmetric", "use": "sig"},
+	{"kty": "RSA", "use": "enc", "kid": "encryption", "n": "bm90LWEtbW9kdWx1cw", "e": "AQAB"},
+	{"kty": "UNKNOWN-2049", "kid": "from-the-future"},
+}
+
 // TestUnusableKeysAreSkippedNotFatal covers a key set carrying
-// something this build cannot use — an encryption key, an unknown key
-// type. The usable keys in the same document must still verify tokens.
+// something this build cannot use. The usable keys in the same document
+// must still verify tokens.
 func TestUnusableKeysAreSkippedNotFatal(t *testing.T) {
 	t.Parallel()
 
 	iss := authtest.NewIssuer(t)
 
-	// The issuer's real set, prefixed with entries of the kinds a
-	// provider legitimately publishes and this package must ignore: a
-	// symmetric key, an encryption key, and a key type this build of
-	// go-jose cannot represent.
+	// The issuer's real set, prefixed with the unusable entries.
 	var doc map[string]any
-	if err := json.Unmarshal([]byte(iss.JWKS(t)), &doc); err != nil {
+	if err := json.Unmarshal(iss.JWKS(t), &doc); err != nil {
 		t.Fatalf("decoding the issuer's key set: %v", err)
 	}
-	doc["keys"] = append([]any{
-		map[string]any{"kty": "oct", "k": "c2VjcmV0LWtleS1tYXRlcmlhbA", "kid": "symmetric", "use": "sig"},
-		map[string]any{"kty": "RSA", "use": "enc", "kid": "encryption", "n": "bm90LWEtbW9kdWx1cw", "e": "AQAB"},
-		map[string]any{"kty": "UNKNOWN-2049", "kid": "from-the-future"},
-	}, doc["keys"].([]any)...)
-	mixed, err := json.Marshal(doc)
-	if err != nil {
-		t.Fatalf("encoding the doctored key set: %v", err)
+	prefix := make([]any, 0, len(unusableKeys))
+	for _, k := range unusableKeys {
+		prefix = append(prefix, k)
 	}
+	doc["keys"] = append(prefix, doc["keys"].([]any)...)
 
+	a, iss := authAgainstKeySet(t, iss, doc)
+	if _, err := authenticate(t, a, iss.Mint(t, authtest.TokenOptions{Email: alice})); err != nil {
+		t.Fatalf("Authenticate against a key set with unusable entries: %v", err)
+	}
+}
+
+// TestUnusableKeysAreExcludedNotJustOutvoted is the other half, and the
+// one that actually pins the filter. Skipping and keeping look the same
+// from outside whenever a usable key is present in the same document,
+// because the unusable ones fail verification anyway. Published on
+// their own they must leave nothing behind — a set that is entirely
+// unusable is an empty set.
+func TestUnusableKeysAreExcludedNotJustOutvoted(t *testing.T) {
+	t.Parallel()
+
+	for _, key := range unusableKeys {
+		t.Run(key["kid"].(string), func(t *testing.T) {
+			t.Parallel()
+
+			a, iss := authAgainstKeySet(t, authtest.NewIssuer(t), map[string]any{
+				"keys": []any{key},
+			})
+			_, err := authenticate(t, a, iss.Mint(t, authtest.TokenOptions{Email: alice}))
+			if !errors.Is(err, purser.ErrUnauthenticated) {
+				t.Fatalf("Authenticate = %v, want ErrUnauthenticated", err)
+			}
+			if !strings.Contains(err.Error(), "no usable public signing key") {
+				t.Errorf("error = %v, want the key to have been excluded from the set entirely", err)
+			}
+		})
+	}
+}
+
+// authAgainstKeySet serves doc as iss's key set from a second server and
+// returns an authenticator reading keys from there. The tokens still
+// come from iss, so it is the second server the client must trust.
+func authAgainstKeySet(tb testing.TB, iss *authtest.Issuer, doc map[string]any) (*oidc.Auth, *authtest.Issuer) {
+	tb.Helper()
+
+	body, err := json.Marshal(doc)
+	if err != nil {
+		tb.Fatalf("encoding the key set: %v", err)
+	}
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		if _, err := w.Write(mixed); err != nil {
-			t.Errorf("writing the key set: %v", err)
-		}
+		writeBody(w, r, body)
 	}))
-	defer srv.Close()
+	tb.Cleanup(srv.Close)
 
-	// The keys are served from the second server, so that is the one the
-	// client must trust; the tokens still come from iss.
 	a, err := oidc.New(oidc.Options{
 		Issuer:     iss.URL(),
 		Audiences:  []string{authtest.DefaultAudience},
@@ -365,10 +410,279 @@ func TestUnusableKeysAreSkippedNotFatal(t *testing.T) {
 		HTTPClient: srv.Client(),
 	})
 	if err != nil {
+		tb.Fatalf("oidc.New: %v", err)
+	}
+	return a, iss
+}
+
+// TestRedirectToPlaintextIsRefused is a regression test, and the attack
+// it describes is complete: the key material is authenticated by TLS
+// and by nothing else, so a hop from https to http hands the whole key
+// set to whoever is on the path. An http.Client follows up to ten
+// redirects by default and crosses schemes on the way, which made the
+// scheme checks on Issuer, on JWKSURL and on a discovered jwks_uri
+// cover only the first URL in the chain.
+//
+// On the key endpoint it is a complete bypass on its own: without the
+// policy the attacker's key set is believed and their token
+// authenticates. On the discovery endpoint the scheme check on the
+// document's jwks_uri catches the plainest version, so what the policy
+// adds there is that the document is not read over cleartext at all —
+// an on-path attacker who can answer for a host they hold a certificate
+// for would otherwise get an https jwks_uri of their own past that
+// check, on a document naming the right issuer.
+func TestRedirectToPlaintextIsRefused(t *testing.T) {
+	t.Parallel()
+
+	// The attacker's key set, served over http. Their tokens claim the
+	// victim issuer, so if this set were believed they would
+	// authenticate here as anybody.
+	attacker := authtest.NewIssuer(t)
+	plaintext := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/.well-known/openid-configuration" {
+			// The victim issuer, so the RFC 8414 §3.3 check passes, and
+			// a jwks_uri of the attacker's own. It arrives in the query
+			// because the redirector is the only party that knows the
+			// victim's ephemeral URL.
+			writeBody(w, r, []byte(fmt.Sprintf(`{"issuer":%q,"jwks_uri":%q}`,
+				r.URL.Query().Get("issuer"), "http://"+r.Host+"/jwks")))
+			return
+		}
+		writeBody(w, r, attacker.JWKS(t))
+	}))
+	// t.Cleanup, not defer: the subtests below are parallel, so they
+	// resume after this function has returned. A defer would close the
+	// server out from under them and every case would "fail" on a
+	// refused connection instead of on the redirect.
+	t.Cleanup(plaintext.Close)
+
+	t.Run("on the key endpoint", func(t *testing.T) {
+		t.Parallel()
+
+		victim := authtest.NewIssuer(t)
+		redirector := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, plaintext.URL+"/jwks", http.StatusFound)
+		}))
+		defer redirector.Close()
+
+		a, err := oidc.New(oidc.Options{
+			Issuer:     victim.URL(),
+			Audiences:  []string{authtest.DefaultAudience},
+			JWKSURL:    redirector.URL,
+			HTTPClient: redirector.Client(),
+		})
+		if err != nil {
+			t.Fatalf("oidc.New: %v", err)
+		}
+
+		token := attacker.Mint(t, authtest.TokenOptions{Email: alice, Issuer: victim.URL()})
+		c, err := authenticate(t, a, token)
+		if err == nil {
+			t.Fatalf("Authenticate succeeded as %q: the key set was read over cleartext", c.Identity)
+		}
+		if !errors.Is(err, purser.ErrUnauthenticated) {
+			t.Errorf("error = %v, want purser.ErrUnauthenticated", err)
+		}
+		if !strings.Contains(err.Error(), "refusing a redirect to http://") {
+			t.Errorf("error = %v, want the redirect policy to be what refused it", err)
+		}
+	})
+
+	t.Run("on the discovery endpoint", func(t *testing.T) {
+		t.Parallel()
+
+		redirector := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, plaintext.URL+r.URL.Path+"?issuer="+url.QueryEscape(selfURL(r)),
+				http.StatusFound)
+		}))
+		defer redirector.Close()
+
+		a, err := oidc.New(oidc.Options{
+			Issuer:     redirector.URL,
+			Audiences:  []string{authtest.DefaultAudience},
+			HTTPClient: redirector.Client(),
+		})
+		if err != nil {
+			t.Fatalf("oidc.New: %v", err)
+		}
+
+		token := attacker.Mint(t, authtest.TokenOptions{Email: alice, Issuer: redirector.URL})
+		c, err := authenticate(t, a, token)
+		if err == nil {
+			t.Fatalf("Authenticate succeeded as %q: the discovery document was read over cleartext",
+				c.Identity)
+		}
+		if !strings.Contains(err.Error(), "refusing a redirect to http://") {
+			t.Errorf("error = %v, want the redirect policy to be what refused it", err)
+		}
+	})
+
+	t.Run("an https redirect is still followed", func(t *testing.T) {
+		t.Parallel()
+
+		// The control. The policy refuses the scheme change, not
+		// redirects: a provider that moves its key endpoint and answers
+		// 302 to another https URL must keep working.
+		iss := authtest.NewIssuer(t)
+		mux := http.NewServeMux()
+		mux.HandleFunc("/moved", func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, "/keys", http.StatusFound)
+		})
+		mux.HandleFunc("/keys", func(w http.ResponseWriter, r *http.Request) {
+			writeBody(w, r, iss.JWKS(t))
+		})
+		srv := httptest.NewTLSServer(mux)
+		defer srv.Close()
+
+		a, err := oidc.New(oidc.Options{
+			Issuer:     iss.URL(),
+			Audiences:  []string{authtest.DefaultAudience},
+			JWKSURL:    srv.URL + "/moved",
+			HTTPClient: srv.Client(),
+		})
+		if err != nil {
+			t.Fatalf("oidc.New: %v", err)
+		}
+		if _, err := authenticate(t, a, iss.Mint(t, authtest.TokenOptions{Email: alice})); err != nil {
+			t.Fatalf("Authenticate through an https redirect: %v", err)
+		}
+	})
+
+	t.Run("the caller's own policy still runs", func(t *testing.T) {
+		t.Parallel()
+
+		// The client belongs to the caller. Wrapping it must not
+		// silently drop a CheckRedirect they set.
+		iss := authtest.NewIssuer(t)
+		mux := http.NewServeMux()
+		mux.HandleFunc("/moved", func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, "/keys", http.StatusFound)
+		})
+		mux.HandleFunc("/keys", func(w http.ResponseWriter, r *http.Request) {
+			writeBody(w, r, iss.JWKS(t))
+		})
+		srv := httptest.NewTLSServer(mux)
+		defer srv.Close()
+
+		client := srv.Client()
+		client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+			return errors.New("this deployment does not follow redirects")
+		}
+
+		a, err := oidc.New(oidc.Options{
+			Issuer:     iss.URL(),
+			Audiences:  []string{authtest.DefaultAudience},
+			JWKSURL:    srv.URL + "/moved",
+			HTTPClient: client,
+		})
+		if err != nil {
+			t.Fatalf("oidc.New: %v", err)
+		}
+		_, err = authenticate(t, a, iss.Mint(t, authtest.TokenOptions{Email: alice}))
+		if err == nil {
+			t.Fatal("Authenticate succeeded: the caller's CheckRedirect was dropped")
+		}
+		if !strings.Contains(err.Error(), "does not follow redirects") {
+			t.Errorf("error = %v, want the caller's own policy to be what refused it", err)
+		}
+	})
+}
+
+// TestCallerClientIsNotMutated pins that wrapping the caller's client
+// leaves theirs alone. It is theirs, and they may be using it elsewhere.
+func TestCallerClientIsNotMutated(t *testing.T) {
+	t.Parallel()
+
+	iss := authtest.NewIssuer(t)
+	client := iss.Client()
+	if client.CheckRedirect != nil {
+		t.Fatalf("the test's premise is wrong: httptest's client already has a redirect policy")
+	}
+
+	a, err := oidc.New(oidc.Options{
+		Issuer:     iss.URL(),
+		Audiences:  []string{authtest.DefaultAudience},
+		HTTPClient: client,
+	})
+	if err != nil {
 		t.Fatalf("oidc.New: %v", err)
 	}
 	if _, err := authenticate(t, a, iss.Mint(t, authtest.TokenOptions{Email: alice})); err != nil {
-		t.Fatalf("Authenticate against a key set with unusable entries: %v", err)
+		t.Fatalf("Authenticate: %v", err)
+	}
+	if client.CheckRedirect != nil {
+		t.Errorf("the caller's http.Client had a redirect policy installed on it")
+	}
+}
+
+// panicOnce is a RoundTripper that panics on its first call.
+type panicOnce struct {
+	inner  http.RoundTripper
+	panics atomic.Int32
+}
+
+func (p *panicOnce) RoundTrip(r *http.Request) (*http.Response, error) {
+	if p.panics.Add(1) == 1 {
+		panic("purser test: the transport blew up")
+	}
+	return p.inner.RoundTrip(r)
+}
+
+// TestPanicDuringAFetchDoesNotWedgeTheSingleFlight is a regression test.
+//
+// The fetch runs with the inflight slot set and its done channel open.
+// A panic that escaped without clearing them left every later request
+// parked on that channel until its own context ended, with none ever
+// reaching a fetch again: one panic, and the process authenticates
+// nobody for the rest of its life. net/http recovers a panic per
+// connection, so the process survives to be in that state.
+//
+// A caller-supplied Transport is the reachable way in, and it is the
+// one used here.
+func TestPanicDuringAFetchDoesNotWedgeTheSingleFlight(t *testing.T) {
+	t.Parallel()
+
+	iss := authtest.NewIssuer(t)
+	client := iss.Client()
+	client.Transport = &panicOnce{inner: client.Transport}
+
+	a, err := oidc.New(oidc.Options{
+		Issuer:     iss.URL(),
+		Audiences:  []string{authtest.DefaultAudience},
+		HTTPClient: client,
+		// The floor is not what this test is about, and a wedged
+		// single flight must not be mistaken for a rate limit.
+		KeyRefreshFloor: time.Nanosecond,
+	})
+	if err != nil {
+		t.Fatalf("oidc.New: %v", err)
+	}
+	token := iss.Mint(t, authtest.TokenOptions{Email: alice})
+
+	panicked := func() (p bool) {
+		defer func() { p = recover() != nil }()
+		_, _ = authenticate(t, a, token)
+		return false
+	}()
+	if !panicked {
+		t.Fatal("the panicking transport did not panic; the test proves nothing")
+	}
+
+	// The next request must reach a fetch rather than park on the
+	// abandoned inflight. A goroutine and a deadline, because the
+	// failure mode is a block, not a wrong answer.
+	done := make(chan error, 1)
+	go func() {
+		_, err := authenticate(t, a, token)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Authenticate after the panic: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Authenticate after the panic blocked: the single flight is wedged")
 	}
 }
 
@@ -401,7 +715,7 @@ func TestBadKeyEndpoints(t *testing.T) {
 			handler: func(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, "the provider is having a day", http.StatusServiceUnavailable)
 			},
-			wantErr: "503",
+			wantErr: "503 Service Unavailable",
 		},
 		{
 			name: "a response too large to read",

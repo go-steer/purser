@@ -693,6 +693,34 @@ key fetch to a JWK Set of its own and signs tokens for any identity.
 RFC 8414 §3.3 requires it. The `jwks_uri` need only be https — the key
 endpoint legitimately lives on another host, as Google's does.
 
+**And a redirect may not leave https.** The scheme checks above are the
+whole of what authenticates the published keys, and `http.Client`
+follows up to ten redirects by default, crossing from https to http on
+the way — so on their own those checks cover only the first URL in a
+chain. purser copies the caller's client and gives the copy a
+`CheckRedirect` that refuses any hop to a non-https URL; a
+`CheckRedirect` the caller set still runs, after that one. On the key
+endpoint the hop is a complete bypass by itself: the attacker's key set
+is read in cleartext, believed, and thereafter signs tokens as anybody.
+On the discovery endpoint the `jwks_uri` scheme check catches the
+plainest version, and what the policy adds is that the document is not
+read over cleartext at all.
+
+**A claim is looked up by its exact key.** `encoding/json` matches an
+object key to a struct field case-insensitively when no exact match
+exists, and of two keys that fold-equal the *last* one in the payload
+wins — even against an exact match earlier. Unmarshalling the payload
+into a tagged claims struct therefore lets an appended `AUD` override
+the `aud` that gets validated, and `EXP`, `SUB`, `ISS` and
+`Email_Verified` likewise, while the separate exact-keyed decode that
+builds the labels reports the true value, so the two disagree and the
+decision uses the wrong one. The registered names are reserved by every
+IdP; their case variants are reserved by none, and several providers let
+an application append claims of its own, so the variant arrives on a
+genuinely issuer-signed token. The payload is decoded once into
+`map[string]json.RawMessage` and every claim this package reads is taken
+from it by name.
+
 **Refusals, and why each one is not configurable:**
 
 - **Symmetric algorithms and `none`.** The permitted set is an
@@ -718,7 +746,24 @@ endpoint legitimately lives on another host, as Google's does.
   source of addresses is the HR system.
 - **A key published for another algorithm.** A provider's RSA key
   published as `PS256` must not verify an `RS256` signature: different
-  padding, same key, and the issuer said which one it signs with.
+  padding, same key, and the issuer said which one it signs with. Only
+  the provider can supply that binding, and only by setting `alg` on the
+  JWK — go-jose verifies against the bare public key and never consults
+  the `JSONWebKey` it came from — so a key set that omits `alg` (legal
+  per RFC 7517 §4.4, and some providers do) is constrained by the
+  configured allowlist and no further.
+- **A payload that is not a JSON object.** `null`, an array, a bare
+  string or number. Read as an empty object it would be a token with no
+  claims at all, refused by the audience check today and by nothing at
+  all if that check ever moved.
+- **A timestamp outside the range of an `int64` second.** `int64` of an
+  out-of-range float is implementation-defined; on amd64 it saturates to
+  `math.MinInt64` and `time.Unix` wraps to the distant past, so
+  `"nbf": 1e300` would read as long ago and the not-before check would
+  pass. A fail-open on a timestamp nobody can read.
+- **An identity that is blank.** `" "` satisfies every non-empty check
+  in this module, including `purser.Caller.IsZero`, and then sits in an
+  ACL and an audit record as something no operator can see.
 
 **`Caller.Admin` is never read from a claim.** A token that could assert
 its own admin bit would be a privilege escalation the moment an operator
@@ -1077,6 +1122,18 @@ would build alone.
   value in `TokenOptions.Claims` **removes** the claim, which is how a
   test reaches the payloads a well-behaved provider never emits and an
   attacker will (`{"exp": nil}` — no expiry at all).
+- **`Issuer.RawToken(t, RawTokenOptions)`** — the same, for a token
+  malformed in its *header* rather than its claims: an `alg` the key was
+  not published for, a `kid` naming a key that did not sign it, no `kid`
+  at all, `alg: none`, an HS256 MAC keyed by the issuer's own public key
+  (`PublicKey`), or a payload that is not JSON (`Claims` returns the one
+  `Mint` would have signed, to build on). Those are precisely the tokens
+  the refusals above exist for, and a harness that cannot mint them
+  leaves each of those tests asserting that some *other* defect was
+  caught — which is what the first draft of this package did. Signing
+  with an overridden header rather than splicing base64 segments is what
+  makes the result a real token that lies, rather than a corrupt one any
+  parser rejects.
 - **Golden matrix test** for `Authorize`, pinning the
   Admin / Owner / Viewer / Contributor table. It lives in
   `authz/authz_test.go` rather than in `authtest`: core-agent's grid is

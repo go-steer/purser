@@ -21,6 +21,7 @@ import (
 	"math"
 	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-steer/purser"
@@ -52,26 +53,38 @@ var surfacedClaims = []string{"iss", "sub", "email", "exp", "aud", "nbf", "iat"}
 // issuer's. What is checked here is whether the issuer meant them for
 // this service, now.
 func (a *Auth) callerFromPayload(payload []byte) (purser.Caller, error) {
-	var c claims
-	if err := json.Unmarshal(payload, &c); err != nil {
+	raw, err := splitClaims(payload)
+	if err != nil {
+		return purser.Caller{}, fmt.Errorf("purser/oidc: %v: %w", err, purser.ErrUnauthenticated)
+	}
+	c, err := registeredClaims(raw)
+	if err != nil {
 		return purser.Caller{}, fmt.Errorf("purser/oidc: decoding claims: %v: %w", err, purser.ErrUnauthenticated)
 	}
-	all, err := decodeAllClaims(payload)
+	all, err := decodeAllClaims(raw)
 	if err != nil {
 		return purser.Caller{}, fmt.Errorf("purser/oidc: %v: %w", err, purser.ErrUnauthenticated)
 	}
 
-	if err := a.validate(&c); err != nil {
+	if err := a.validate(c); err != nil {
 		return purser.Caller{}, fmt.Errorf("purser/oidc: %v: %w", err, purser.ErrUnauthenticated)
 	}
-	identity, err := a.identityFrom(&c, all)
+	identity, err := a.identityFrom(c, all)
 	if err != nil {
 		return purser.Caller{}, fmt.Errorf("purser/oidc: %v: %w", err, purser.ErrUnauthenticated)
+	}
+	if strings.TrimSpace(identity) == "" {
+		// Not merely empty — blank. An identity of " " satisfies every
+		// non-empty check in this package and in purser.Caller.IsZero,
+		// and then sits in an ACL and an audit record as something no
+		// operator can see.
+		return purser.Caller{}, fmt.Errorf("purser/oidc: the claim resolving the identity is blank: %w",
+			purser.ErrUnauthenticated)
 	}
 
 	return purser.Caller{
 		Identity: identity,
-		Labels:   labelsFrom(&c, all),
+		Labels:   labelsFrom(c, all),
 		// Admin is never read from a claim. Policy decides it, over
 		// these labels — see authz.Rules.
 		Admin: false,
@@ -90,7 +103,10 @@ func (a *Auth) validate(c *claims) error {
 	if !slices.ContainsFunc(a.audiences, func(want string) bool {
 		return slices.Contains(c.Audience, want)
 	}) {
-		return fmt.Errorf("token audience %v does not include any of %v", []string(c.Audience), a.audiences)
+		// %q, not %v: this is the one claim-derived value in the package
+		// that reaches a log message as a list, and an "aud" element
+		// carrying a newline would otherwise inject a line into it.
+		return fmt.Errorf("token audience %q does not include any of %q", []string(c.Audience), a.audiences)
 	}
 
 	now := a.now()
@@ -214,17 +230,76 @@ func scalarString(v any) (string, bool) {
 	return "", false
 }
 
-// decodeAllClaims unmarshals the payload into a generic map, keeping
-// numbers as their literal text.
-func decodeAllClaims(payload []byte) (map[string]any, error) {
-	dec := json.NewDecoder(bytes.NewReader(payload))
-	dec.UseNumber()
-	var all map[string]any
-	if err := dec.Decode(&all); err != nil {
+// splitClaims separates the payload into its claims, keyed byte for
+// byte.
+//
+// Every claim this package reads is looked up here rather than
+// unmarshalled into a tagged struct, and that is a security property,
+// not a style. encoding/json matches an object key to a struct field
+// case-insensitively when no exact match exists, and of two keys that
+// fold-equal, the last one in the payload wins. Unmarshalling the
+// payload straight into the claims struct therefore lets a claim named
+// "AUD" overwrite the "aud" that gets validated — while a second,
+// exact-keyed decode for the labels reports the real one, so the two
+// disagree and the decision uses the wrong one. The same trick reaches
+// "EXP", "SUB", "ISS" and "Email_Verified".
+//
+// It is not hypothetical. The registered names are reserved by every
+// IdP; their case variants are reserved by none, and several providers
+// let an application append claims of its own to the payload. The
+// variant then arrives on a genuinely issuer-signed token.
+func splitClaims(payload []byte) (map[string]json.RawMessage, error) {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &raw); err != nil {
 		return nil, fmt.Errorf("decoding claims: %w", err)
 	}
-	if all == nil {
+	if raw == nil {
 		return nil, fmt.Errorf("the token payload is JSON null, not an object")
+	}
+	return raw, nil
+}
+
+// registeredClaims fills the claims struct from exact key matches.
+func registeredClaims(raw map[string]json.RawMessage) (*claims, error) {
+	var c claims
+	for _, f := range []struct {
+		name string
+		dst  any
+	}{
+		{"iss", &c.Issuer},
+		{"sub", &c.Subject},
+		{"aud", &c.Audience},
+		{"exp", &c.Expiry},
+		{"nbf", &c.NotBefore},
+		{"iat", &c.IssuedAt},
+		{"email", &c.Email},
+		{"email_verified", &c.EmailVerified},
+	} {
+		v, ok := raw[f.name]
+		if !ok {
+			continue
+		}
+		if err := json.Unmarshal(v, f.dst); err != nil {
+			return nil, fmt.Errorf("%q: %w", f.name, err)
+		}
+	}
+	return &c, nil
+}
+
+// decodeAllClaims decodes every claim into a generic value, keeping
+// numbers as their literal text.
+func decodeAllClaims(raw map[string]json.RawMessage) (map[string]any, error) {
+	all := make(map[string]any, len(raw))
+	for name, v := range raw {
+		dec := json.NewDecoder(bytes.NewReader(v))
+		dec.UseNumber()
+		var x any
+		if err := dec.Decode(&x); err != nil {
+			// Unreachable: raw came from a successful decode of the
+			// same bytes, so every value in it is well-formed JSON.
+			return nil, fmt.Errorf("decoding the %q claim: %w", name, err)
+		}
+		all[name] = x
 	}
 	return all, nil
 }
@@ -295,6 +370,14 @@ func (d *numericDate) UnmarshalJSON(b []byte) error {
 		return fmt.Errorf("timestamp %s is not a finite number", n)
 	}
 	sec, frac := math.Modf(f)
+	// int64(sec) on an out-of-range float is implementation-defined; on
+	// amd64 it saturates to math.MinInt64, and time.Unix then wraps to
+	// an instant in the distant past. "nbf": 1e300 would read as long
+	// ago and the not-before check would pass — a fail-open on a
+	// timestamp nobody can read. Refused instead.
+	if sec >= math.MaxInt64 || sec < math.MinInt64 {
+		return fmt.Errorf("timestamp %s is out of range", n)
+	}
 	*d = numericDate(time.Unix(int64(sec), int64(frac*float64(time.Second))))
 	return nil
 }

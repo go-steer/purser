@@ -15,12 +15,10 @@
 package oidc_test
 
 import (
-	"encoding/base64"
 	"errors"
 	"maps"
 	"net/http"
 	"net/http/httptest"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -245,47 +243,164 @@ func TestOversizeTokenIsRefusedBeforeParsing(t *testing.T) {
 // TestAlgorithmConfusionIsRefused covers the two classic JWS attacks.
 // Both are refused at parse, by the allowlist, before any key is
 // consulted.
+//
+// Each case asserts on the reason as well as the refusal. Every token
+// here is also malformed in some way an unrelated check would catch —
+// an empty signature, a subject nobody provisioned — so a bare
+// ErrUnauthenticated would be satisfied by a verifier that had no
+// allowlist at all. That the key endpoint was never touched is the
+// other half: it holds whatever go-jose words its error as.
 func TestAlgorithmConfusionIsRefused(t *testing.T) {
 	t.Parallel()
 
-	iss, a := newAuth(t, nil)
+	claims := func(iss *authtest.Issuer) []byte {
+		return iss.Claims(t, authtest.TokenOptions{Subject: "attacker", Email: alice})
+	}
 
 	t.Run("alg none", func(t *testing.T) {
-		header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none","typ":"JWT"}`))
-		payload := base64.RawURLEncoding.EncodeToString([]byte(
-			`{"iss":"` + iss.URL() + `","sub":"attacker","aud":["` + authtest.DefaultAudience +
-				`"],"exp":` + expiryIn(time.Hour) + `,"email":"` + alice + `","email_verified":true}`))
-		token := header + "." + payload + "."
+		t.Parallel()
 
-		if _, err := authenticate(t, a, token); !errors.Is(err, purser.ErrUnauthenticated) {
+		iss, a := newAuth(t, nil)
+		token := iss.RawToken(t, authtest.RawTokenOptions{
+			Payload:  claims(iss),
+			Unsigned: true,
+		})
+
+		_, err := authenticate(t, a, token)
+		if !errors.Is(err, purser.ErrUnauthenticated) {
 			t.Fatalf("Authenticate(alg=none) = %v, want ErrUnauthenticated", err)
 		}
-	})
-
-	t.Run("HMAC", func(t *testing.T) {
-		// A symmetric signature over otherwise valid claims. If HS256
-		// were on the allowlist, the secret an attacker would use is
-		// the issuer's public key, which is published.
-		signer, err := jose.NewSigner(
-			jose.SigningKey{Algorithm: jose.HS256, Key: []byte("0123456789abcdef0123456789abcdef")},
-			(&jose.SignerOptions{}).WithType("JWT"))
-		if err != nil {
-			t.Fatalf("building an HS256 signer: %v", err)
+		if !strings.Contains(err.Error(), `unexpected signature algorithm "none"`) {
+			t.Errorf("error = %v, want the allowlist to be what refused it", err)
 		}
-		jws, err := signer.Sign([]byte(`{"iss":"` + iss.URL() + `","sub":"attacker","aud":["` +
-			authtest.DefaultAudience + `"],"exp":` + expiryIn(time.Hour) + `}`))
-		if err != nil {
-			t.Fatalf("signing: %v", err)
-		}
-		token, err := jws.CompactSerialize()
-		if err != nil {
-			t.Fatalf("serializing: %v", err)
-		}
-
-		if _, err := authenticate(t, a, token); !errors.Is(err, purser.ErrUnauthenticated) {
-			t.Fatalf("Authenticate(HS256) = %v, want ErrUnauthenticated", err)
+		if got := iss.JWKSRequests(); got != 0 {
+			t.Errorf("JWKS fetches = %d, want 0: an unlisted algorithm is refused before any key work", got)
 		}
 	})
+
+	t.Run("HMAC keyed by the issuer's public key", func(t *testing.T) {
+		t.Parallel()
+
+		// The attack in its real form: the secret is the verification
+		// key the issuer publishes, so a verifier that accepted HS256
+		// would find this signature valid. A test that used a random
+		// secret would pass against that verifier too.
+		iss, a := newAuth(t, nil)
+		token := iss.RawToken(t, authtest.RawTokenOptions{
+			Payload: claims(iss),
+			HMACKey: iss.PublicKey(t, ""),
+			Header:  map[string]any{"kid": iss.KeyID(t)},
+		})
+
+		_, err := authenticate(t, a, token)
+		if !errors.Is(err, purser.ErrUnauthenticated) {
+			t.Fatalf("Authenticate(HS256 over the published key) = %v, want ErrUnauthenticated", err)
+		}
+		if !strings.Contains(err.Error(), `unexpected signature algorithm "HS256"`) {
+			t.Errorf("error = %v, want the allowlist to be what refused it", err)
+		}
+		if got := iss.JWKSRequests(); got != 0 {
+			t.Errorf("JWKS fetches = %d, want 0: an unlisted algorithm is refused before any key work", got)
+		}
+	})
+
+	t.Run("HMAC named in the header over a real RS256 signature", func(t *testing.T) {
+		t.Parallel()
+
+		// The header says HS256; underneath is a genuine RS256 signature
+		// by the issuer's key. The allowlist reads the header, so this is
+		// refused for the same reason — and pins that the header's "alg"
+		// is what the allowlist is applied to, not whatever the key
+		// happens to be.
+		iss, a := newAuth(t, nil)
+		token := iss.RawToken(t, authtest.RawTokenOptions{
+			Payload: claims(iss),
+			Header:  map[string]any{"alg": "HS256"},
+		})
+
+		_, err := authenticate(t, a, token)
+		if !errors.Is(err, purser.ErrUnauthenticated) {
+			t.Fatalf("Authenticate(HS256 header, RS256 signature) = %v, want ErrUnauthenticated", err)
+		}
+		if !strings.Contains(err.Error(), `unexpected signature algorithm "HS256"`) {
+			t.Errorf("error = %v, want the allowlist to be what refused it", err)
+		}
+	})
+}
+
+// TestKeyIDConfusionIsRefused pins that the key named in the header is
+// the key the signature is checked against. A verifier that fell back
+// to trying every published key would accept this, and a rotation would
+// then never take a compromised key out of service.
+func TestKeyIDConfusionIsRefused(t *testing.T) {
+	t.Parallel()
+
+	iss, a := newAuth(t, func(o *oidc.Options) { o.KeyRefreshFloor = time.Nanosecond })
+	first := iss.KeyID(t)
+	second := iss.AddKey(t, "RS256")
+
+	// Signed by the second key, labelled as the first. Both are
+	// published, both are RS256, and the signature is a real one.
+	token := iss.RawToken(t, authtest.RawTokenOptions{
+		Payload:  iss.Claims(t, authtest.TokenOptions{Email: alice}),
+		SignWith: second,
+		Header:   map[string]any{"kid": first},
+	})
+
+	_, err := authenticate(t, a, token)
+	if !errors.Is(err, purser.ErrUnauthenticated) {
+		t.Fatalf("Authenticate(signed by %s, labelled %s) = %v, want ErrUnauthenticated", second, first, err)
+	}
+	if !strings.Contains(err.Error(), "does not verify") {
+		t.Errorf("error = %v, want the signature check to be what refused it", err)
+	}
+
+	// The same signature under its own key ID is accepted, so the
+	// refusal above is the label and nothing else.
+	honest := iss.RawToken(t, authtest.RawTokenOptions{
+		Payload:  iss.Claims(t, authtest.TokenOptions{Email: alice}),
+		SignWith: second,
+	})
+	if _, err := authenticate(t, a, honest); err != nil {
+		t.Fatalf("Authenticate(signed by %s, labelled %s): %v", second, second, err)
+	}
+}
+
+// TestTokenWithNoKeyIDIsVerifiedAgainstEveryKey covers the header a
+// single-key provider legitimately emits. "kid" is optional, and a
+// verifier that required it would reject those providers outright.
+func TestTokenWithNoKeyIDIsVerifiedAgainstEveryKey(t *testing.T) {
+	t.Parallel()
+
+	iss, a := newAuth(t, func(o *oidc.Options) { o.KeyRefreshFloor = time.Nanosecond })
+	iss.AddKey(t, "RS256")
+	third := iss.AddKey(t, "RS256")
+
+	// The last of three published keys, with nothing in the header to
+	// say so: the two before it are tried and fail before it is reached.
+	token := iss.RawToken(t, authtest.RawTokenOptions{
+		Payload:   iss.Claims(t, authtest.TokenOptions{Email: alice}),
+		SignWith:  third,
+		OmitKeyID: true,
+	})
+	c, err := authenticate(t, a, token)
+	if err != nil {
+		t.Fatalf("Authenticate(no kid): %v", err)
+	}
+	if c.Identity != alice {
+		t.Errorf("identity = %q, want %q", c.Identity, alice)
+	}
+
+	// An unpublished key with no "kid" is still refused: trying every
+	// key is not the same as trusting any.
+	forged := iss.RawToken(t, authtest.RawTokenOptions{
+		Payload:        iss.Claims(t, authtest.TokenOptions{Email: alice}),
+		UnpublishedKey: true,
+		OmitKeyID:      true,
+	})
+	if _, err := authenticate(t, a, forged); !errors.Is(err, purser.ErrUnauthenticated) {
+		t.Fatalf("Authenticate(no kid, unpublished key) = %v, want ErrUnauthenticated", err)
+	}
 }
 
 // TestJSONSerializationIsRefused pins the choice of
@@ -337,20 +452,32 @@ func TestKeyPublishedForAnotherAlgorithmIsNotUsed(t *testing.T) {
 	})
 	kid := iss.AddKey(t, "PS256")
 
-	// The same key, the same bytes, signing RS256 instead. go-jose will
-	// not do that for us, so the token is assembled by hand from a
-	// PS256 token's payload and an RS256 header naming the PS256 key.
-	ps := iss.Mint(t, authtest.TokenOptions{Email: alice, KeyID: kid})
-	parts := strings.Split(ps, ".")
-	if len(parts) != 3 {
-		t.Fatalf("minted token has %d segments, want 3", len(parts))
-	}
-	header := base64.RawURLEncoding.EncodeToString(
-		[]byte(`{"alg":"RS256","kid":"` + kid + `","typ":"JWT"}`))
-	forged := header + "." + parts[1] + "." + parts[2]
+	// A genuine RS256 signature by the key the JWK Set publishes as
+	// PS256: the same modulus, the padding the issuer did not sanction.
+	// The signature verifies against that key material, so the only
+	// thing that can refuse this token is the "alg" the key is published
+	// under — which is exactly what is under test. Splicing an RS256
+	// header onto a PS256 signature would not do: that token is refused
+	// by the signature check whether the binding exists or not.
+	forged := iss.RawToken(t, authtest.RawTokenOptions{
+		Payload:   iss.Claims(t, authtest.TokenOptions{Email: alice}),
+		SignWith:  kid,
+		Algorithm: "RS256",
+	})
 
-	if _, err := authenticate(t, a, forged); !errors.Is(err, purser.ErrUnauthenticated) {
-		t.Fatalf("Authenticate(RS256 header over a PS256 key) = %v, want ErrUnauthenticated", err)
+	_, err := authenticate(t, a, forged)
+	if !errors.Is(err, purser.ErrUnauthenticated) {
+		t.Fatalf("Authenticate(RS256 signature by a key published as PS256) = %v, want ErrUnauthenticated", err)
+	}
+	if !strings.Contains(err.Error(), "publishes no key matching") {
+		t.Errorf("error = %v, want the key selection to be what refused it", err)
+	}
+
+	// The same key signing what it was published for is accepted, so the
+	// refusal above is the algorithm binding and not the key.
+	honest := iss.Mint(t, authtest.TokenOptions{Email: alice, KeyID: kid})
+	if _, err := authenticate(t, a, honest); err != nil {
+		t.Fatalf("Authenticate(PS256 signature by the PS256 key): %v", err)
 	}
 }
 
@@ -512,10 +639,4 @@ func TestNewAcceptsGoodOptions(t *testing.T) {
 	if a == nil {
 		t.Fatal("New returned a nil Auth with a nil error")
 	}
-}
-
-// expiryIn renders a NumericDate the given duration from now, for the
-// hand-assembled tokens above.
-func expiryIn(d time.Duration) string {
-	return strconv.FormatInt(time.Now().Add(d).Unix(), 10)
 }

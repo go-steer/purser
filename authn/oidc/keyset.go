@@ -77,11 +77,43 @@ func newKeySet(opts keySetOptions) *keySet {
 	return &keySet{
 		issuer:  opts.Issuer,
 		jwksURL: opts.JWKSURL,
-		client:  client,
+		client:  httpsOnly(client),
 		refresh: opts.Refresh,
 		floor:   opts.RefreshFloor,
 		now:     time.Now,
 	}
+}
+
+// httpsOnly returns client with a redirect policy that cannot leave
+// https.
+//
+// The scheme check on Issuer, on JWKSURL and on a discovered jwks_uri
+// is the whole of what authenticates the published keys. An http.Client
+// follows up to ten redirects by default and will cross from https to
+// http on the way, so without this those checks only cover the first
+// URL in the chain: an endpoint answering "302 Location: http://..."
+// gets its key set read in cleartext, and an on-path attacker
+// substitutes it and thereafter signs tokens as anybody. The same hop
+// on the discovery document yields one naming the right issuer — so the
+// RFC 8414 §3.3 check passes — and an attacker's jwks_uri.
+//
+// The client is copied rather than mutated: it belongs to the caller,
+// who may be using it elsewhere. Any policy the caller set still runs,
+// after this one.
+func httpsOnly(client *http.Client) *http.Client {
+	inner := client.CheckRedirect
+	c := *client
+	c.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if req.URL.Scheme != "https" {
+			return fmt.Errorf("refusing a redirect to %s: the key material is authenticated by TLS "+
+				"and by nothing else", req.URL.Redacted())
+		}
+		if inner != nil {
+			return inner(req, via)
+		}
+		return nil
+	}
+	return &c
 }
 
 // inflight is one fetch several goroutines wait on. The fields are
@@ -112,6 +144,15 @@ func (k *keySet) keysFor(ctx context.Context, kid, alg string) ([]jose.JSONWebKe
 			// out of every service — and the request still has to
 			// present a token signed by that key and inside its
 			// validity window.
+			//
+			// The cost is that KeyRefresh bounds the life of a
+			// withdrawn key only while fetches succeed: fetchedAt
+			// advances on success alone, so an IdP that stays
+			// unreachable keeps a withdrawn key verifying for as long
+			// as the outage lasts. Availability is chosen over that,
+			// deliberately — the alternative is that an IdP outage is
+			// also a total authentication outage — and Options.
+			// KeyRefresh says so.
 			return match, nil
 		}
 		return nil, err
@@ -140,7 +181,7 @@ func (k *keySet) snapshot() ([]jose.JSONWebKey, time.Time) {
 // own, and is returned instead of a fetch — otherwise a request that
 // arrived a microsecond behind a concurrent refresh would be refused by
 // the floor with a current key set sitting right in front of it.
-func (k *keySet) refreshKeys(ctx context.Context, since time.Time) ([]jose.JSONWebKey, error) {
+func (k *keySet) refreshKeys(ctx context.Context, since time.Time) (keys []jose.JSONWebKey, err error) {
 	k.mu.Lock()
 	if k.fetchedAt.After(since) {
 		keys := k.keys
@@ -168,18 +209,36 @@ func (k *keySet) refreshKeys(ctx context.Context, since time.Time) ([]jose.JSONW
 	k.lastAttempt = k.now()
 	k.mu.Unlock()
 
-	keys, err := k.fetch(ctx)
-
-	k.mu.Lock()
-	f.keys, f.err = keys, err
-	if err == nil {
-		k.keys = keys
-		k.fetchedAt = k.now()
+	// Publishing the result and clearing the slot happen in a defer, so
+	// that a panic below cannot leave inflight set and done unclosed.
+	// net/http recovers a panic per connection, so the process survives
+	// it — and every later request would then park on done until its own
+	// context ended, with no request ever reaching the fetch again. A
+	// caller-supplied Transport and a dependency decoding hostile JWKS
+	// bytes are both inside this window.
+	release := func() {
+		k.mu.Lock()
+		f.keys, f.err = keys, err
+		if err == nil {
+			k.keys = keys
+			k.fetchedAt = k.now()
+		}
+		k.inflight = nil
+		k.mu.Unlock()
+		close(f.done)
 	}
-	k.inflight = nil
-	k.mu.Unlock()
-	close(f.done)
+	defer func() {
+		if r := recover(); r != nil {
+			// The waiters get an error; this goroutine keeps panicking,
+			// because a panic here is a bug and swallowing it hides one.
+			keys, err = nil, fmt.Errorf("panic fetching the key set from %s: %v", k.issuer, r)
+			release()
+			panic(r)
+		}
+		release()
+	}()
 
+	keys, err = k.fetch(ctx)
 	return keys, err
 }
 
@@ -240,7 +299,10 @@ func (k *keySet) resolveJWKSURL(ctx context.Context) (string, error) {
 // A token naming a key ID is matched against that ID alone. A token
 // naming none — legal, and what a provider with a single key sometimes
 // emits — is matched against every key, which is why the caller tries
-// them in turn rather than trusting the first.
+// them in turn rather than trusting the first. That also bounds the
+// verification work an unauthenticated request can ask for at the
+// number of keys the issuer publishes, which for the major providers is
+// two or three.
 func selectKeys(keys []jose.JSONWebKey, kid, alg string) []jose.JSONWebKey {
 	var out []jose.JSONWebKey
 	for i := range keys {
@@ -252,6 +314,13 @@ func selectKeys(keys []jose.JSONWebKey, kid, alg string) []jose.JSONWebKey {
 		// Without this a provider's RSA key published as PS256 would
 		// also verify RS256 — different padding, same key, and the
 		// issuer said which one it signs with.
+		//
+		// Only the provider can supply that binding, and only by
+		// setting "alg" on the JWK: go-jose verifies against the bare
+		// public key and never consults the JSONWebKey it came from. A
+		// key set that omits "alg" — legal per RFC 7517 §4.4, and some
+		// providers do — constrains the header to the configured
+		// allowlist and no further.
 		if key.Algorithm != "" && alg != "" && key.Algorithm != alg {
 			continue
 		}

@@ -191,6 +191,10 @@ type Options struct {
 	// keys the issuer's keys: nothing else in this package
 	// authenticates the JWKS endpoint, so an attacker who could
 	// substitute its response could sign tokens as anybody.
+	//
+	// The client is copied, not retained, and the copy is given a
+	// redirect policy that refuses any hop to a non-https URL. A
+	// CheckRedirect of the caller's own still runs after that one.
 	HTTPClient *http.Client
 
 	// IdentityClaim names the claim to use as Caller.Identity. Empty
@@ -237,6 +241,13 @@ type Options struct {
 	// This is what bounds how long a key withdrawn by the issuer keeps
 	// verifying tokens here, since the demand-driven refetch below
 	// only triggers on a key ID this process has never seen.
+	//
+	// It bounds it only while fetches succeed. When the refetch fails
+	// and a matching key is already cached, the cached key is served
+	// rather than the request refused, so an issuer that stays
+	// unreachable keeps a withdrawn key alive for as long as the outage
+	// lasts. That is the deliberate trade: the alternative is that
+	// every IdP outage is also a total authentication outage.
 	KeyRefresh time.Duration
 
 	// KeyRefreshFloor is the minimum interval between fetches of the
@@ -570,6 +581,11 @@ func positiveOrDefault(name string, v, def int64) (int64, error) {
 func stringSet(xs []string) map[string]struct{} {
 	out := make(map[string]struct{}, len(xs))
 	for _, x := range xs {
+		// A configuration value that never got set must not become an
+		// identity permitted to proxy. Belt and braces today: CanProxyAs
+		// refuses the zero Caller first, and purser.Caller.IsZero is
+		// defined as an empty Identity, so nothing can currently reach
+		// the lookup with "". This does not depend on that staying true.
 		if x == "" {
 			continue
 		}
