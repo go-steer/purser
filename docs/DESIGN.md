@@ -277,8 +277,9 @@ purser/
       match.go               admission matchers, both profiles
     oidc/                    issuer + JWKS + claim mapping -> Caller
   authz/
-    authz.go                 Action, SessionACL, Authorize
-    rules.go                 pattern-based role rules
+    authz.go                 Action, Role, ACL, RoleOf, Allows, Authorize
+    rules.go                 Matcher, Rule, Rules: service-wide grants
+    authenticator.go         WithRules: a rule set applied to an Authenticator
   httpmw/
     caller.go                caller middleware + auth-source verdict
     csrf.go                  browser write guard
@@ -315,7 +316,7 @@ deployments:
 |---|---|
 | [`pkg/auth/auth.go`](https://github.com/go-steer/core-agent/blob/09b6cd1d9c97fa1e2673bac2e664d97579c68b24/pkg/auth/auth.go) | `purser/caller.go` |
 | [`pkg/auth/authenticator.go`](https://github.com/go-steer/core-agent/blob/09b6cd1d9c97fa1e2673bac2e664d97579c68b24/pkg/auth/authenticator.go) | `authn/authn.go` + `authn/bearer/` |
-| [`pkg/auth/authorize.go`](https://github.com/go-steer/core-agent/blob/09b6cd1d9c97fa1e2673bac2e664d97579c68b24/pkg/auth/authorize.go) | `authz/authz.go` |
+| [`pkg/auth/authorize.go`](https://github.com/go-steer/core-agent/blob/09b6cd1d9c97fa1e2673bac2e664d97579c68b24/pkg/auth/authorize.go) | `authz/authz.go` (matrix preserved, nouns dropped — see [below](#authzauthzgo--the-matrix-without-the-nouns)) |
 | [`pkg/auth/users.go`](https://github.com/go-steer/core-agent/blob/09b6cd1d9c97fa1e2673bac2e664d97579c68b24/pkg/auth/users.go) | `authn/bearer/users.go` (keep the 0600 mode check) |
 | [`pkg/attach/caller_middleware.go`](https://github.com/go-steer/core-agent/blob/09b6cd1d9c97fa1e2673bac2e664d97579c68b24/pkg/attach/caller_middleware.go) | `httpmw/caller.go` |
 | [`pkg/attach/csrf.go`](https://github.com/go-steer/core-agent/blob/09b6cd1d9c97fa1e2673bac2e664d97579c68b24/pkg/attach/csrf.go) | `httpmw/csrf.go` |
@@ -633,6 +634,44 @@ falling back to `sub`), and remaining claims copied into `Caller.Labels`.
 This is the human-operator path: it removes the need to issue client
 certificates to laptops.
 
+### `authz/authz.go` — the matrix without the nouns
+
+This design originally said `authz.go` would export `Action`,
+`SessionACL` and `Authorize`. It exports `Action`, `Role`, `ACL`,
+`RoleOf`, `Allows` and `Authorize`: the matrix is core-agent's, cell for
+cell, but the vocabulary is not. `SessionACL` became `ACL` and the
+actions lost their resource prefix, because a *session* is core-agent's
+noun and [`AGENTS.md`](../AGENTS.md) makes shipping it here a hard rule
+— "session ACLs, role names, and admin lists belong to the consuming
+service." A library that names one consumer's resource type invites the
+second consumer to authorize its jobs against a struct called
+`SessionACL`, and by then the name is API.
+
+Core-agent keeps its own `SessionACL` and its own `session.read` /
+`daemon.admin` spellings in a phase-2 wrapper that is four lines and one
+`switch`, and keeps them in its audit records where they belong.
+`Action.String` deliberately renders `"read"`, not `"session.read"`, so
+that wrapper prefixes rather than translates.
+
+`Allows` is exported alongside `Authorize` for the service that resolves
+a role some other way — from a group-membership service, or from a role
+already recorded on the resource — and still wants one matrix.
+
+Three behaviors worth stating, all stricter than the code they came
+from. A `Caller` with an empty `Identity` is `RoleNone` **before** the
+`Admin` bit is consulted, so a half-initialized struct cannot own a
+resource whose `ACL.Owner` was never populated either. An `Action` this
+build does not know denies rather than falling through to a permissive
+default — with the single documented exception that `RoleAdmin` still
+passes, since admin is defined as "everything", including verbs added
+after this binary was built. And `Allows` range-checks the `Role` it is
+given: every grant below `RoleAdmin` is a `>=` comparison, so a value
+above `RoleAdmin` would satisfy all of them. That is not hypothetical
+precisely because `Allows` is exported for services resolving roles
+their own way — an integer read back from a row written by a newer peer,
+or an off-by-one in a service's mapping table, is exactly where such a
+value comes from.
+
 ### `authz/rules.go` — rules, not rows
 
 The actual fix for the scale objection.
@@ -640,10 +679,125 @@ The actual fix for the scale objection.
 and
 [`ProxyIdentities`](https://github.com/go-steer/core-agent/blob/09b6cd1d9c97fa1e2673bac2e664d97579c68b24/pkg/config/config.go#L1113)
 are exact-match `[]string` today, and scale no better than `users.json`
-does. They are replaced by an ordered rule list matching on identity
-pattern, SPIFFE path segment, certificate subject field, or OIDC claim,
-and granting `Admin` or proxy capability. Exact-match strings remain
-valid as the degenerate rule, so existing configs keep working.
+does. They are replaced by a rule list matching on identity, email
+domain, SPIFFE path segments, certificate fields or OIDC claims — any of
+which are `Caller` labels by the time `authz` sees them — and granting
+`Admin` or proxy capability. `MatchIdentity` is the degenerate rule, so
+existing configs keep working.
+
+**Not ordered, and no deny.** This design said "ordered rule list"; the
+shipped `Rules` is a union. Order is what makes a policy engine hard to
+reason about — whether a grant survives depends on what precedes it —
+and the ordering only buys anything once there are deny rules. There are
+none: every rule grants, `Rules.Apply` never clears a bit somebody else
+set, and an exception is written inside the matcher that grants it,
+`MatchAll(MatchPathPrefix(…), MatchNot(MatchIdentity(…)))`. A rule set
+therefore means the same thing however it is sorted, and a deployment
+running both a legacy `ProxyIdentities` list and a rule set during a
+migration loses nobody.
+
+**Matchers fail closed on their own configuration.** `Matcher` is
+`func(purser.Caller) bool` rather than the error-returning shape
+`mtls.CertMatcher` uses, because a rule set is assembled once at startup
+and consulted per request: there is no per-request error to report, only
+a configuration that never got set. `MatchEmailDomain("")`,
+`MatchLabel("group")` with no values, `MatchLabel("group", "")`,
+`MatchPathPrefix(key)` with no segments, `MatchAll()` with no matchers
+and `MatchNot(nil)` all match *nobody*. The `MatchLabel` case is the
+sharp one — `Caller.Label` returns `""` for an absent label, so an unset
+config value that matched `""` would grant to every caller that does not
+carry the label at all.
+
+`MatchAll()`'s empty case is the **opposite of `mtls.MatchCertAll`'s**,
+and the asymmetry is the point. An admission matcher is an additional
+restriction on a peer the TLS stack already verified, so an empty
+conjunction there removes a constraint. Here the conjunction is the
+entire predicate of a grant, so an empty one *is* the grant:
+`MatchAll(cfg.Matchers...)` over a config section nobody filled in would
+hand `Admin` to every caller. The consequence is that this package
+supplies no spelling for "everyone" — a deployment that means it writes
+`func(purser.Caller) bool { return true }` in its own source, where it
+is visible in review, the same move `client.NewSPIFFE` forces with
+`spiffeid.MatchAny()`. `MatchNot(nil)` denies for the same reason,
+against the logically pure reading that `not(nobody)` is everyone: an
+exception that was never configured must not inflate into a blanket
+grant. Only a `nil` is recognisable that way — `MatchNot(MatchAll())` is
+a closure that matches nobody, indistinguishable from a deliberate one,
+and does mean everyone.
+
+Path matching is **segment-anchored**, for the reason the SPIFFE
+admission matchers are: `strings.Contains(path, "/ns/prod")` admits
+`/ns/attacker/x/ns/prod/sa/y`, and `strings.HasPrefix` admits
+`/ns/production`. `MatchEmailDomain` anchors on the last `@` for the
+same reason `HasSuffix(email, "example.com")` cannot be used —
+`alice@notexample.com` is one registration away — and folds the domain's
+case over **ASCII only**. `strings.EqualFold` applies Unicode simple
+folding, under which `ſlack.com` (U+017F) and `slacK.com` (U+212A, the
+Kelvin sign) both equal `slack.com`: separately registrable IDN domains
+satisfying a rule that names neither.
+
+**An exception is only as wide as the comparison it is written in.**
+`MatchEmailDomain` folds case; `MatchIdentity` and `ACL` membership are
+byte-exact, because an identity is an opaque string and canonicalizing
+it belongs to the authenticator that minted it, where the credential's
+own rules are known. So `MatchAll(MatchEmailDomain("example.com"),
+MatchNot(MatchIdentity("mallory@example.com")))` grants
+`Mallory@example.com`, and whether that is reachable depends on whether
+the identity's spelling is pinned upstream. `MatchNot`'s doc says to
+except on the property the grant is written in; a test pins the
+behaviour so the edge cannot be discovered in production.
+
+**No grant reaches a caller nothing authenticated**, and two mechanisms
+say so because one is not enough. `Rules` refuses the zero `Caller` *and*
+`purser.AnonymousIdentity` — the identity an unauthenticated request
+resolves to wherever anonymous access is allowed, which is not zero and
+would otherwise be matched like any other. `WithRules` additionally
+refuses at construction an authenticator reporting
+`purser.AuthSourceAnonymous`, which covers a deployment that configured
+some other fallback identity: applying policy to an authenticator that
+verifies nothing is granting on the strength of a request that presented
+nothing.
+
+**Label keys are arguments, not constants declared here.** A rule reads
+`MatchPathPrefix(mtls.LabelPath, "ns", "prod")`. `authz` is stdlib-only
+and cannot import `authn/mtls`; re-declaring `"spiffe.path"` in a second
+package is how two spellings of one key drift apart, so the key is
+passed in and a test in `authz` pins the agreement by using the real
+constant.
+
+**Every rule is named, and the name is required and unique.**
+`Rules.Matching(c)` returns the names that fired, which is what makes
+"why is this caller an admin" answerable from an audit record rather
+than by re-deriving policy by hand.
+
+### `authz/authenticator.go` — connecting rules to a surface
+
+`Rules` is data nothing consults until `WithRules(auth, rules)` wraps an
+`authn.Authenticator` in it: every `Caller` the wrapped authenticator
+resolves passes through `Rules.Apply`, `CanProxyAs` becomes the union of
+the rules and whatever allowlist the authenticator already had, and an
+identity reached through `authn.IdentityLookup` gets the same grants it
+would have had authenticating directly.
+
+It is a decorator in `authz` rather than a `Rules` field on
+`httpmw.CallerOptions` so that policy stays out of the middleware and
+the composition is reusable by a surface that is not HTTP.
+
+The awkward part is real and worth recording: `authn`'s optional
+extensions are discovered by type assertion, so the wrapper must
+implement *exactly* the ones the wrapped authenticator implements —
+hence four unexported variants and a type switch. Dropping
+`authn.IdentityLookup` would make `httpmw` take every asserted identity
+at face value; adding it to an authenticator with no table would make
+`httpmw` reject every assertion as unprovisioned; and implementing
+`authn.CredentialGate` unconditionally means inventing an answer for an
+authenticator that gave none — claim `true` and `httpmw.NewCaller`
+accepts `Enforce` over an authenticator that admits every request, with
+`CheckBind` then reporting the surface as safe to expose.
+`authn.AuthenticatorWithProxy` is the one exception, always implemented,
+because rules may grant proxying on their own — and it reads the same as
+not implementing it when neither the rules nor the wrapped authenticator
+permit anyone.
 
 ### `client/mtls.go`
 
@@ -815,7 +969,12 @@ would build alone.
   and JWKS and minting signed tokens, including rotation and
   wrong-audience cases.
 - **Golden matrix test** for `Authorize`, pinning the
-  Admin / Owner / Viewer / Contributor table.
+  Admin / Owner / Viewer / Contributor table. It lives in
+  `authz/authz_test.go` rather than in `authtest`: core-agent's grid is
+  ported cell for cell with the nouns mapped onto the generic actions,
+  and it tests this package's own matrix rather than anything a consumer
+  implements. `WithRules` is held to `RunAuthenticatorSuite` like any
+  other authenticator — a decorator is one.
 
 ### Repo setup
 
