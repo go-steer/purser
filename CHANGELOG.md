@@ -311,6 +311,69 @@ in [`CONTRIBUTING.md`](./CONTRIBUTING.md).
   few makes `httpmw` take asserted identities at face value, and too many
   makes it reject every assertion as unprovisioned, or accept `Enforce` over
   an authenticator that admits everything.
+- `authn/oidc`: caller identity from an OpenID Connect ID token — the
+  human-operator path, so an engineer's morning sign-in authenticates them to a
+  service without anyone issuing, distributing, or revoking a certificate for
+  their laptop. `oidc.New` validates options and returns without touching the
+  network; discovery and the first key fetch happen on the first request that
+  presents a token, so a service starts with a briefly unreachable IdP rather
+  than coming up with an authenticator that rejects everything. Only the server
+  half is here: obtaining a token is the client's problem.
+  It builds on `github.com/go-jose/go-jose/v4` for JWS verification and JWK
+  decoding, and owns the layer above it. go-oidc was the alternative, and since
+  it depends on go-jose anyway the choice was about policy rather than
+  dependency count: its key set applies no rate limit to a token naming an
+  uncached key, its verifier checks a single client ID rather than a set of
+  audiences, and it carries a hardcoded schemeless-issuer exemption for
+  `accounts.google.com`.
+- `authn/oidc`: the key cache has two knobs, bounding opposite hazards.
+  `KeyRefresh` (15m) is how long a key the issuer *withdrew* keeps verifying
+  tokens here — the demand-driven refetch cannot notice a withdrawal, because
+  the key ID is one the cache has seen. `KeyRefreshFloor` (30s) is the minimum
+  interval between fetches: a token's key ID is read from its *unverified*
+  header, so without a floor anyone who can reach the surface can name an
+  uncached key ID and turn this service into an amplifier pointed at its own
+  IdP. Concurrent refetches are single-flighted and detached from the request
+  that triggered them, so the first client to hang up does not cancel the fetch
+  for everyone waiting behind it; when a fetch fails and a matching key is
+  already cached, the cached key is served, because an IdP that is briefly down
+  must not log every operator out of every service.
+- `authn/oidc`: a discovery document is followed only if it declares the issuer
+  it was fetched from (RFC 8414 §3.3). Without that check, anything that can
+  answer at the issuer's well-known path can point the key fetch at a JWK Set
+  of its own and sign tokens for any identity. The `jwks_uri` need only be
+  https — a provider's keys legitimately live on another host, as Google's do.
+- `authn/oidc`: the refusals. Signature algorithms are an allowlist (`RS*`,
+  `PS*`, `ES*`, `EdDSA`), so symmetric algorithms and `none` cannot be
+  configured back in and a future go-jose addition cannot become acceptable by
+  default — a verifier that accepts `HS256` can be handed a token signed with
+  the issuer's *public* key. Tokens are parsed with `ParseSignedCompact`, not
+  `ParseSigned`, which also accepts the multi-signature JSON serialization. A
+  key published for one algorithm does not verify another. `Audiences` may not
+  be empty, since the audience is the only thing distinguishing a token minted
+  for this service from one minted for any other service of the same issuer. A
+  token with no `exp` is refused, RFC 7519 making it optional
+  notwithstanding: such a token is a bearer credential valid forever.
+- `authn/oidc`: `Caller.Identity` is the `email` claim, falling back to `sub`,
+  or whichever claim `IdentityClaim` names — with no fallback in that case,
+  because a deployment that asked for one claim and silently got another would
+  have two shapes of identity in its ACLs. An email-derived identity requires
+  `email_verified`, since on most providers the address is a self-service
+  profile field. Claims reach policy as labels: `oidc.issuer`, `oidc.sub`,
+  `oidc.email`, `oidc.expires_at`, and every other scalar claim under
+  `oidc.claim/`. Arrays and objects are dropped rather than flattened.
+  `Caller.Admin` is never read from a claim, and `authn.IdentityLookup` is
+  deliberately not implemented — there is no table of provisioned identities
+  behind a claim-based authenticator, so `ProxyIdentities` is the whole control
+  on the proxy path.
+- `authtest.NewIssuer`: an in-process OpenID Connect provider, serving
+  discovery and a JWK Set over TLS and minting signed tokens. `AddKey` is the
+  gradual rotation and `Rotate` the abrupt one; `JWKSRequests` and
+  `DiscoveryRequests` are what a test asserts a key cache against; `Close` is
+  the IdP outage, after which it still mints. A nil value in
+  `TokenOptions.Claims` removes the claim rather than setting it to null, which
+  is how a test reaches the payloads a well-behaved provider never emits and an
+  attacker will.
 
 ### Changed
 - `authtest.CA` is now a thin wrapper over an internal, error-returning CA core
