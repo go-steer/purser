@@ -1162,8 +1162,21 @@ Two library-specific additions over the service repos:
 `dev/tools/verify-apidiff` + `dev/api-breaks.txt`, because the exported
 surface is the product; and no `Dockerfile` / `deploy/` /
 `verify-go-toolchain`, because purser ships no binary and no image.
-`dev/tools/verify-coverage` is deferred to phase 1a, when there is code
-for a floor to mean anything.
+`dev/tools/verify-coverage`, deferred until there was code for a floor to
+mean anything, landed at the end of phase 1a. It holds each package to a
+floor in `dev/coverage-floors.txt` rather than the module to one number:
+a repo-wide percentage lets a large, easily-covered package fund the gaps
+in a small dangerous one, and averaging is what makes coverage gates
+worthless. Every package in the profile needs an entry, so a new one
+cannot arrive unmeasured — the same reason `verify-apidiff` runs in
+module mode. Lowering a floor is legitimate and costs one reviewable diff
+hunk in the PR that lowers it, exactly as `dev/api-breaks.txt` works for
+the exported API.
+
+What the floor does *not* claim: PR #13 found four security tests that
+passed with their defense removed, all of them fully covering the code
+they failed to test. Coverage cannot tell a real assertion from a vacuous
+one. It is the floor under adversarial review, never a substitute for it.
 
 Keep the root package, `authz`, `httpmw`, and the PKI half of
 `authn/mtls` **stdlib-only**. go-spiffe, the JWT/JWKS library, and

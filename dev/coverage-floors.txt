@@ -1,0 +1,57 @@
+# Per-package statement-coverage floors. Read and enforced by
+# dev/tools/verify-coverage against the profile dev/tools/test-unit writes.
+#
+# One entry per package: "<import path> <floor>". Blank lines and everything
+# after a `#` are ignored. Every package in the coverage profile needs an
+# entry — a new package with no floor fails the check rather than slipping in
+# unmeasured.
+#
+# The floors are per package rather than one number for the module because a
+# single repo-wide percentage is exactly the metric that lets a 100%-covered
+# authz hide an untested branch in authn/oidc. Averaging is what makes
+# coverage gates worthless; this file refuses to average.
+#
+# A floor is a ratchet, not a target. It sits a point or so under the real
+# number so ordinary churn doesn't turn an unrelated PR red, and lowering one
+# is a reviewable diff hunk in the PR that lowers it — the same bargain
+# dev/api-breaks.txt makes for the exported API. Raise a floor when a package
+# earns it; verify-coverage nags when one has drifted far enough below the
+# truth to have stopped meaning anything.
+#
+# Numbers in the trailing comments are what the packages measured when the
+# floor was last set (2026-08-30).
+
+# The identity contract and the interfaces every consumer codes against.
+# These are small, pure, and entirely reachable from tests: 100 is not
+# aspirational here, it is the current state, and anything less is a new
+# exported path that arrived without one.
+github.com/go-steer/purser                       100.0
+github.com/go-steer/purser/authn                 100.0
+github.com/go-steer/purser/authn/bearer          100.0
+github.com/go-steer/purser/internal/tlsfloor     100.0
+
+# The verification paths. Short of 100 for the arms that need a crypto/tls or
+# net/http failure that cannot be provoked in-process.
+github.com/go-steer/purser/authn/mtls             98.0  # 99.1
+github.com/go-steer/purser/authn/oidc             96.0  # 97.0
+github.com/go-steer/purser/authz                  97.0  # 98.4
+github.com/go-steer/purser/client                 97.0  # 98.3
+github.com/go-steer/purser/httpmw                 98.0  # 98.9
+
+# Test support. authtest is held to the same standard as the code it exercises
+# — a conformance suite that is itself untested reports what it was written to
+# report. Its uncovered remainder is the panic-on-misuse arms.
+github.com/go-steer/purser/authtest               90.0  # 91.6
+github.com/go-steer/purser/internal/ca            84.0  # 84.6
+
+# The worked example. Its libraries carry real tests; its three commands are
+# `package main` wiring, exercised end to end by dev/tools/smoke over real
+# sockets — which produces no profile, hence 0. The entries exist so that
+# adding logic to a main, rather than to the packages under it, is a visible
+# choice rather than an unmeasured one.
+github.com/go-steer/purser/examples/internal/credentials  87.0  # 88.3
+github.com/go-steer/purser/examples/internal/hello        90.0  # 91.3
+github.com/go-steer/purser/examples/internal/profile      89.0  # 89.9
+github.com/go-steer/purser/examples/cmd/hello-client       0.0
+github.com/go-steer/purser/examples/cmd/hello-server       0.0
+github.com/go-steer/purser/examples/cmd/mint-credentials   0.0
