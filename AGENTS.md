@@ -110,7 +110,9 @@ Conventions worth knowing at agent prompt time:
   fails on incompatible ones that `dev/api-breaks.txt` does not acknowledge. See
   "Changing the exported API" in [`CONTRIBUTING.md`](./CONTRIBUTING.md).
 - **`[Unreleased]` grows on every merged PR.** Any user-visible change adds a
-  bullet under `## [Unreleased]` in `CHANGELOG.md` as part of the PR.
+  bullet under `## [Unreleased]` in `CHANGELOG.md` as part of the PR. Cutting a
+  release closes that section and empties `dev/api-breaks.txt` — the procedure
+  is "Cutting a release" in [`CONTRIBUTING.md`](./CONTRIBUTING.md).
 - **Harness settings are not committed.** `.claude/` (and a personal `CLAUDE.md`)
   are git-ignored; the repo-native enforcement is this file + the required CI
   check. The only checked-in Claude Code config is the opt-in sample under
@@ -121,8 +123,10 @@ Conventions worth knowing at agent prompt time:
 **Phase 1a complete.** The identity contract, `authtest` and its conformance
 suite, the bearer-token table, both mTLS profiles, `client`, `httpmw`,
 `authn/oidc`, and `authz` are all in, with a worked example under `examples/`
-and per-package coverage floors over the lot. Nothing is tagged, so the
-exported API is still free to move — but it is what phase 2 will migrate
-`core-agent` and `mast` onto, so changing it is a design conversation, not a
-refactor. Phase 1b (service-mesh / sidecar-terminated TLS) is optional and
-unstarted; see the phase table in [`docs/DESIGN.md`](./docs/DESIGN.md).
+and per-package coverage floors over the lot. Tagged `v0.1.0`, which is what
+gave `verify-apidiff` its first baseline — before that tag it skipped every
+run. Pre-1.0 the exported API may still break at a minor version, but it is
+what phase 2 will migrate `core-agent` and `mast` onto, so changing it is a
+design conversation, not a refactor — and never a silent one. Phase 1b
+(service-mesh / sidecar-terminated TLS) is optional and unstarted; see the
+phase table in [`docs/DESIGN.md`](./docs/DESIGN.md).
