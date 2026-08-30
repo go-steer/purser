@@ -418,6 +418,16 @@ in [`CONTRIBUTING.md`](./CONTRIBUTING.md).
   `KeyID` and `PublicKey` name and export the current signing key. `JWKS`
   returns the served document's bytes and `DefaultSubject` is exported
   alongside `DefaultAudience`.
+- `dev/tools/verify-coverage` + `dev/coverage-floors.txt`, the last item
+  deferred out of the scaffold: every package is held to its own statement
+  floor, not the module to one number, because a repo-wide average lets a
+  large easily-covered package fund the gaps in a small dangerous one. A
+  package with no floor fails the check rather than arriving unmeasured, and
+  lowering a floor costs one reviewable diff hunk in the PR that lowers it —
+  the bargain `dev/api-breaks.txt` already makes for the exported API. It
+  runs in `dev/tools/ci` right after `test`, on the profile that step wrote,
+  and regenerates a profile that is missing or older than a `.go` file rather
+  than passing on a stale one. No change to the exported API.
 
 ### Changed
 - `authtest.CA` is now a thin wrapper over an internal, error-returning CA core

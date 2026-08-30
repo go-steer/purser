@@ -8,13 +8,14 @@ A purser is the officer who checks who is aboard. That is the whole job here —
 turn a TLS connection or an HTTP request into a `Caller`, and answer whether
 that caller may perform an action.
 
-> **Status: phase 1a, in progress.** The identity contract, the test harness,
-> the bearer-token table, both mTLS profiles — standard-CA and SPIFFE — the
+> **Status: phase 1a complete.** The identity contract, the test harness, the
+> bearer-token table, both mTLS profiles — standard-CA and SPIFFE — the
 > dialling half in `client`, the HTTP middleware, OIDC, and the authorization
-> layer are in place, with a worked example under [`examples/`](./examples/).
-> Every phase-1a package is written; the coverage floor
-> [`docs/DESIGN.md`](./docs/DESIGN.md) defers to this phase is what remains,
-> and nothing here is importable as a stable API until phase 1a is complete.
+> layer are in place, with a worked example under [`examples/`](./examples/)
+> and a per-package coverage floor holding them there. The API is not tagged
+> yet, so treat it as unstable until there is a release: phase 2 migrates
+> `core-agent` and `mast` onto it, and what that first real consumer runs into
+> is what the tag will reflect.
 
 ## Why it exists
 

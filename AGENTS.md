@@ -50,6 +50,7 @@ dev/ci/presubmits/lint-go   # golangci-lint (auto-installs the pinned version)
 dev/ci/presubmits/verify-go-format  # gofmt + goimports (fix: dev/tools/fix-go-format)
 dev/ci/presubmits/verify-mod-tidy   # go.mod/go.sum are tidy
 dev/ci/presubmits/verify-apidiff    # exported-API diff vs the last release tag
+dev/ci/presubmits/verify-coverage   # per-package floors (dev/coverage-floors.txt)
 dev/ci/presubmits/verify-vuln       # govulncheck
 ```
 
@@ -71,7 +72,10 @@ tests need are minted in-process — do not check fixture keys into the repo.
   titles/bodies, or any committed/published artifact. Author under your own name.
   See [`CONTRIBUTING.md`](./CONTRIBUTING.md).
 - **Tests before merging.** Every new package ships unit tests; a bug fix ships a
-  regression test.
+  regression test. A new package also needs a floor in `dev/coverage-floors.txt`
+  — `verify-coverage` fails on a package that has none, rather than letting it
+  in unmeasured. Lowering an existing floor is allowed and belongs in the same
+  PR as the code that made it necessary, with a comment saying why.
 
 ## How we develop
 
@@ -114,7 +118,11 @@ Conventions worth knowing at agent prompt time:
 
 ## Current state
 
-**Scaffold.** The module, the license, and the CI guardrails are in place; there
-is no library code yet beyond `doc.go`. Phase 1a — the identity contract, the
-PKI and SPIFFE mTLS profiles, OIDC, the authorization rules, and the client
-dialers — is the next work.
+**Phase 1a complete.** The identity contract, `authtest` and its conformance
+suite, the bearer-token table, both mTLS profiles, `client`, `httpmw`,
+`authn/oidc`, and `authz` are all in, with a worked example under `examples/`
+and per-package coverage floors over the lot. Nothing is tagged, so the
+exported API is still free to move — but it is what phase 2 will migrate
+`core-agent` and `mast` onto, so changing it is a design conversation, not a
+refactor. Phase 1b (service-mesh / sidecar-terminated TLS) is optional and
+unstarted; see the phase table in [`docs/DESIGN.md`](./docs/DESIGN.md).

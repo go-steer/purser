@@ -76,6 +76,28 @@ that the call *failed*, not merely that it returned something.
 Mint certificates in-process from a test CA. No private keys in the repo,
 not even expired ones.
 
+## Coverage floors
+
+`dev/tools/verify-coverage` holds every package to a floor in
+[`dev/coverage-floors.txt`](./dev/coverage-floors.txt), reading the profile
+`dev/tools/test-unit` writes. Per package, not one number for the module:
+a repo-wide average lets a large, easily-covered package fund the gaps in a
+small dangerous one.
+
+This is a floor, not a bar. Coverage cannot tell a real assertion from a
+vacuous one — an auth test that executes every line of a check and asserts
+nothing about its verdict scores the same as one that would catch a
+bypass. It says only that a branch was executed once, which is the weakest
+useful claim and still worth having: the characteristic failure in this
+repo is a verification path no test ever reaches.
+
+- **A new package needs an entry.** Without one the check fails rather than
+  letting the package in unmeasured. The tool prints the line to paste.
+- **Lowering a floor is allowed** — in the PR that makes it necessary, with
+  a `#` comment saying why, so the reviewer sees it next to the code.
+- **Raising one** is never required to merge; the tool nags when a floor has
+  drifted far enough below the truth to have stopped protecting anything.
+
 ## License
 
 By contributing you agree your contributions are licensed under the
