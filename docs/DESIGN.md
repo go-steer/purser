@@ -275,7 +275,11 @@ purser/
       spiffe.go              NewSPIFFE() -> (*tls.Config, *SPIFFEAuth)
       spiffefiles.go         SPIFFEFileSource: file-backed, reloading SVID + bundle
       match.go               admission matchers, both profiles
-    oidc/                    issuer + JWKS + claim mapping -> Caller
+    oidc/
+      oidc.go                Options, New() -> *Auth, token extraction + JWS verify
+      discovery.go           the well-known document; issuer check
+      keyset.go              JWKS cache: demand + age refetch, floor, single flight
+      claims.go              claim validation, identity resolution, labels
   authz/
     authz.go                 Action, Role, ACL, RoleOf, Allows, Authorize
     rules.go                 Matcher, Rule, Rules: service-wide grants
@@ -634,6 +638,154 @@ falling back to `sub`), and remaining claims copied into `Caller.Labels`.
 This is the human-operator path: it removes the need to issue client
 certificates to laptops.
 
+It verifies a token the client already holds. The OAuth 2.0
+authorization code flow is not implemented and is not planned here:
+obtaining a token is the client's problem (`gcloud auth
+print-identity-token`, an IdP device flow, an oauth2 library), and the
+server half is the part every consuming service needs.
+
+**go-jose, not go-oidc.** `github.com/go-jose/go-jose/v4` supplies JWS
+parsing, signature verification, and JWK decoding; the layer above it —
+discovery, the key cache, claim validation, identity resolution — is
+purser's. go-oidc was the alternative and would have been fewer lines,
+but it depends on go-jose anyway, so the choice was never about
+dependency count. It was about which policies this repository owns.
+Three of go-oidc's are wrong here: its `RemoteKeySet` single-flights
+concurrent refetches but applies **no rate limit** to a token whose key
+ID it has not cached, its verifier checks one `ClientID` rather than a
+set of audiences, and it carries a hardcoded schemeless-issuer exemption
+for `accounts.google.com`. Vendoring the parsing and owning the policy
+costs a few hundred lines and makes each of those a decision recorded
+here.
+
+**Construction does no network I/O.** `New` validates options and
+returns; discovery and the first key fetch happen on the first request
+that presents a token. A service must start with its IdP briefly
+unreachable, and — more to the point — must not come up holding an
+authenticator that rejects everything because a fetch at construction
+failed.
+
+**Two knobs bound the key cache, and they bound opposite hazards.**
+
+| Option | Default | Bounds |
+|---|---|---|
+| `KeyRefresh` | 15m | How long a key the issuer **withdrew** keeps verifying tokens here |
+| `KeyRefreshFloor` | 30s | How often an unauthenticated caller can make this service **fetch** from its IdP |
+
+The floor is the one that is easy to miss. A token's key ID is read from
+its *unverified* header, so anyone who can reach the surface can name a
+key ID that is not cached; without a floor, each such request becomes a
+fetch, and the service is an amplifier pointed at its own IdP. With one,
+a rotation this process has not yet seen costs its callers at most that
+long. `KeyRefresh` covers what the demand-driven path cannot: a
+withdrawn key ID is one the cache has *seen*, so nothing about it looks
+unknown, and only age forces the refetch that drops it.
+
+When a fetch fails and a matching key is already cached, the cached key
+is served. An IdP that is briefly down must not log every operator out
+of every service, and the request still has to present a token signed by
+that key and inside its validity window.
+
+**The discovery document must name the issuer it was fetched from.**
+This is the check that makes following discovery safe: without it,
+anything that can answer at the issuer's well-known path redirects the
+key fetch to a JWK Set of its own and signs tokens for any identity.
+RFC 8414 §3.3 requires it. The `jwks_uri` need only be https — the key
+endpoint legitimately lives on another host, as Google's does.
+
+**And a redirect may not leave https.** The scheme checks above are the
+whole of what authenticates the published keys, and `http.Client`
+follows up to ten redirects by default, crossing from https to http on
+the way — so on their own those checks cover only the first URL in a
+chain. purser copies the caller's client and gives the copy a
+`CheckRedirect` that refuses any hop to a non-https URL; a
+`CheckRedirect` the caller set still runs, after that one. On the key
+endpoint the hop is a complete bypass by itself: the attacker's key set
+is read in cleartext, believed, and thereafter signs tokens as anybody.
+On the discovery endpoint the `jwks_uri` scheme check catches the
+plainest version, and what the policy adds is that the document is not
+read over cleartext at all.
+
+**A claim is looked up by its exact key.** `encoding/json` matches an
+object key to a struct field case-insensitively when no exact match
+exists, and of two keys that fold-equal the *last* one in the payload
+wins — even against an exact match earlier. Unmarshalling the payload
+into a tagged claims struct therefore lets an appended `AUD` override
+the `aud` that gets validated, and `EXP`, `SUB`, `ISS` and
+`Email_Verified` likewise, while the separate exact-keyed decode that
+builds the labels reports the true value, so the two disagree and the
+decision uses the wrong one. The registered names are reserved by every
+IdP; their case variants are reserved by none, and several providers let
+an application append claims of its own, so the variant arrives on a
+genuinely issuer-signed token. The payload is decoded once into
+`map[string]json.RawMessage` and every claim this package reads is taken
+from it by name.
+
+**Refusals, and why each one is not configurable:**
+
+- **Symmetric algorithms and `none`.** The permitted set is an
+  allowlist (`RS*`, `PS*`, `ES*`, `EdDSA`) rather than a denylist, so an
+  algorithm added to go-jose in a future release cannot become
+  acceptable here without somebody deciding it should be. A verifier
+  that accepts `HS256` can be handed a token signed with the issuer's
+  *public* key, which is published.
+- **The JWS JSON serialization.** `jose.ParseSignedCompact`, not
+  `jose.ParseSigned`: the latter also accepts a form that can carry
+  several signatures with per-signature headers, and "the first
+  signature verified" is the shape of several real CVEs. An ID token is
+  always compact.
+- **An empty `Audiences`.** The audience is the only thing
+  distinguishing a token minted for this service from one minted for any
+  other service of the same issuer.
+- **A missing `exp`.** RFC 7519 makes it optional; this package does
+  not. A token with no expiry is a bearer credential valid forever.
+- **An unverified `email` as the identity.** On most providers the
+  address is a self-service profile field, so a user who can type one
+  could otherwise authenticate as its owner.
+  `Options.AllowUnverifiedEmail` exists for the corporate IdP whose only
+  source of addresses is the HR system.
+- **A key published for another algorithm.** A provider's RSA key
+  published as `PS256` must not verify an `RS256` signature: different
+  padding, same key, and the issuer said which one it signs with. Only
+  the provider can supply that binding, and only by setting `alg` on the
+  JWK — go-jose verifies against the bare public key and never consults
+  the `JSONWebKey` it came from — so a key set that omits `alg` (legal
+  per RFC 7517 §4.4, and some providers do) is constrained by the
+  configured allowlist and no further.
+- **A payload that is not a JSON object.** `null`, an array, a bare
+  string or number. Read as an empty object it would be a token with no
+  claims at all, refused by the audience check today and by nothing at
+  all if that check ever moved.
+- **A timestamp outside the range of an `int64` second.** `int64` of an
+  out-of-range float is implementation-defined, and the two
+  architectures purser runs on disagree about it. amd64's `CVTTSD2SI`
+  returns the "integer indefinite" value `math.MinInt64` regardless of
+  the input's sign, so `"nbf": 1e300` reads as an instant long past and
+  the not-before check passes. arm64's `FCVTZS` genuinely saturates
+  toward the sign, so there the same literal reads as the far future and
+  it is `"exp": 1e300` that fails open, as a token that never expires.
+  Either way a timestamp nobody can read decides the validity window.
+- **An identity that is blank.** `" "` satisfies every non-empty check
+  in this module, including `purser.Caller.IsZero`, and then sits in an
+  ACL and an audit record as something no operator can see.
+
+**`Caller.Admin` is never read from a claim.** A token that could assert
+its own admin bit would be a privilege escalation the moment an operator
+gained write access to their own IdP profile. Claims reach policy as
+labels — `oidc.issuer`, `oidc.sub`, `oidc.email`, `oidc.expires_at`, and
+everything else scalar under `oidc.claim/` — and `authz.Rules` decides.
+Arrays and objects are dropped rather than flattened: joining a `groups`
+array with commas produces a value that matches no policy anyone would
+write and looks like it should, so a group matcher gets added
+deliberately when a real consumer needs one.
+
+**No `authn.IdentityLookup`.** There is no table of provisioned
+identities behind a claim-based authenticator, so an identity asserted
+through the proxy path is taken at face value and
+`Options.ProxyIdentities` is the whole control. Implementing the
+interface with anything other than a real table would either invent
+`Caller`s or reject every assertion.
+
 ### `authz/authz.go` — the matrix without the nouns
 
 This design originally said `authz.go` would export `Action`,
@@ -965,9 +1117,29 @@ would build alone.
   client certs (with chosen SAN/CN shapes) and SPIFFE SVIDs, exposing
   `x509svid.Source` / `x509bundle.Source`. Drives real handshakes on
   both profiles: no disk, no SPIRE, no expiry rot.
-- **`authtest.NewIssuer()`** — `httptest` OIDC issuer serving discovery
+- **`authtest.NewIssuer(t)`** — `httptest` OIDC issuer serving discovery
   and JWKS and minting signed tokens, including rotation and
-  wrong-audience cases.
+  wrong-audience cases. It runs over TLS, because the authenticator
+  refuses a plaintext issuer. `AddKey` is the gradual rotation and
+  `Rotate` the abrupt one; `JWKSRequests` / `DiscoveryRequests` are what
+  a test asserts a key cache against; `Close` is the IdP outage. A nil
+  value in `TokenOptions.Claims` **removes** the claim, which is how a
+  test reaches the payloads a well-behaved provider never emits and an
+  attacker will (`{"exp": nil}` — no expiry at all).
+- **`Issuer.RawToken(t, RawTokenOptions)`** — the same, for a token
+  malformed in its *header* rather than its claims: an `alg` the key was
+  not published for, a `kid` naming a key that did not sign it, no `kid`
+  at all, `alg: none`, an HS256 MAC keyed by the issuer's own public key
+  (`PublicKey`), or a payload that is not JSON (`Claims` returns the one
+  `Mint` would have signed, to build on). Those are precisely the tokens
+  the refusals above exist for, and a harness that cannot mint them
+  leaves each of those tests asserting that some *other* defect was
+  caught — which is what the first draft of this package did. The header
+  is overridden and then *signed over*, rather than spliced on
+  afterwards, which is what makes the result a real token that lies
+  rather than a corrupt one any parser rejects. `alg: none` is the one
+  exception, assembled by hand because go-jose will not sign it — and
+  there the lack of a signature is the point.
 - **Golden matrix test** for `Authorize`, pinning the
   Admin / Owner / Viewer / Contributor table. It lives in
   `authz/authz_test.go` rather than in `authtest`: core-agent's grid is
@@ -1061,9 +1233,18 @@ self-contained.
 9. **Layer separation test.** With a permissive admission policy, assert
    the `Caller` is still fully populated — pinning that admission policy
    never degrades identity extraction.
-10. **OIDC end-to-end** via `authtest.NewIssuer()`: a valid token
+10. **OIDC end-to-end** via `authtest.NewIssuer(t)`: a valid token
    resolves; wrong audience, expired, and rotated-key-not-yet-cached are
-   all rejected.
+   all rejected. Alongside those, the negatives that only a hand-rolled
+   JWS reaches — `alg: none`, an `HS256` signature over otherwise valid
+   claims, the JWS JSON serialization, and an `RS256` header naming a
+   key the issuer published for `PS256`. The key cache gets its own
+   assertions on fetch *counts*, because "correct" here is a number: 20
+   verifications cost one fetch, 50 unknown key IDs under an hour-long
+   floor cost one fetch, 20 concurrent cold-cache requests cost one
+   fetch, and a withdrawn key stops verifying on the first request past
+   `KeyRefresh`. A token asserting `"admin": true` resolves to a
+   non-admin `Caller` with the claim visible as a label.
 11. **Differential test against the source of truth.** Table-drive the
    ported `Authorize`, browser write guard, and transport-gate cases
    from core-agent's existing `pkg/auth/*_test.go` and
