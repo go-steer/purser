@@ -12,6 +12,28 @@ in [`CONTRIBUTING.md`](./CONTRIBUTING.md).
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.1.0] - 2026-08-30
+
+Phase 1a: the whole of the authentication and authorization layer, with no
+consumers on it yet.
+
+**What v0.1.0 is for.** Until now there was no tag, so the only way to depend
+on purser was a commit SHA — and `dev/tools/verify-apidiff` had no baseline to
+measure against, which meant the guard on the thing this module calls its
+product had never actually run. This tag exists to give consumers something to
+pin and that check something to compare to.
+
+**Expect the surface to move.** Pre-1.0, an incompatible change may land at any
+minor version — see "Changing the exported API" in
+[`CONTRIBUTING.md`](./CONTRIBUTING.md). `core-agent` and `mast` migrate onto
+this in phase 2, and that first real integration is the one thing most likely
+to change the API. It will not change silently: from here on every break is
+reported by apidiff, acknowledged in
+[`dev/api-breaks.txt`](./dev/api-breaks.txt), and written down under
+**Changed** or **Removed** below.
+
 ### Added
 - `purser.Caller`, the identity every consumer reads: an `Identity` string,
   free-form `Labels`, and an `Admin` bit set by policy rather than by a
@@ -451,3 +473,6 @@ in [`CONTRIBUTING.md`](./CONTRIBUTING.md).
 - `docs/DESIGN.md`: the design of record — motivation, the two mTLS profiles
   and why they verify with opposite `crypto/tls` idioms, the admission /
   identity split, the phase plan, and the verification each phase owes.
+
+[Unreleased]: https://github.com/go-steer/purser/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/go-steer/purser/releases/tag/v0.1.0

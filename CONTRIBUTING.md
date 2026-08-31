@@ -62,6 +62,39 @@ second, unrelated removal.
 Prefer not to need the escape hatch. Add an option to a struct rather than
 a parameter to a function; deprecate with an alias before removing.
 
+## Cutting a release
+
+A tag is not ceremony here — it is what gives `verify-apidiff` a baseline.
+Before the first one it had nothing to compare against and skipped every
+run, so the guard on the exported surface was inert. Keep tags coming or
+that check quietly stops working.
+
+1. **Land everything first.** `main` green, working tree clean.
+2. **Close the changelog.** Rename `## [Unreleased]` to
+   `## [X.Y.Z] - YYYY-MM-DD`, open a fresh `## [Unreleased]` above it with
+   *Nothing yet.*, and add the two link references at the bottom of the
+   file (`[Unreleased]` compares `vX.Y.Z...HEAD`; `[X.Y.Z]` points at the
+   release tag).
+3. **Empty [`dev/api-breaks.txt`](./dev/api-breaks.txt).** Once the tag
+   moves, those breaks sit behind the new baseline; a leftover entry would
+   silently permit a second, unrelated removal of a symbol that is already
+   gone. Leave the header comments, drop the entries, and update the
+   trailing note to name the new version.
+4. **Merge that as its own `chore/release-vX.Y.Z` PR**, so the tag lands on
+   a commit whose changelog already describes it.
+5. **Tag the merge commit and push it:**
+   ```bash
+   git tag -a -s vX.Y.Z -m "vX.Y.Z"   # annotated + signed
+   git push origin vX.Y.Z
+   ```
+6. **Verify the baseline took.** `dev/tools/verify-apidiff` should now
+   report against the new tag instead of skipping.
+
+Which number: pre-1.0, a breaking change is a **minor** bump (`v0.2.0`),
+not a major one — `v0.x` reserves that right and the module path stays
+unsuffixed. Post-1.0 an incompatible change means `v2` and a `/v2` module
+path, and `dev/api-breaks.txt` should be empty on every release branch.
+
 ## Tests
 
 Every new package ships with unit tests. A new feature without a test
