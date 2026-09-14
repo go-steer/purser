@@ -47,6 +47,7 @@ package buried in a daemon.
 | [`core-tui`](https://github.com/go-steer/core-tui) | client |
 | [`switchboard`](https://github.com/go-steer/switchboard) | client |
 | [`k8s-lookout`](https://github.com/go-steer/k8s-lookout) | server |
+| [`mast-web`](https://github.com/go-steer/mast-web) | server (browser edge), client — authenticates the human, then asserts them to `core-agent` |
 
 ## Packages
 
