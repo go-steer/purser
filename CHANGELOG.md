@@ -12,7 +12,21 @@ in [`CONTRIBUTING.md`](./CONTRIBUTING.md).
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+- `purser.AuthSourceProxyHeader` (wire value `proxy-header`), for a server that
+  reads its caller's identity from a header set by a fronting proxy and
+  verifies no credential itself — the oauth2-proxy / `X-Forwarded-Email` shape
+  behind an authenticating load balancer. The enum previously had no truthful
+  value for it: `iap` is reserved for a *validated* gateway signature,
+  `asserted` presumes a proxy-permitted credential underneath, and `anonymous`
+  denies an attribution the server is about to make. This is the weakest source
+  purser defines and the only one resting on deployment topology rather than
+  cryptography; treat it as less trustworthy than any verified value.
+  ([#17](https://github.com/go-steer/purser/issues/17))
+
+  A consumer that switches exhaustively on `AuthSource` will not fail to
+  compile — Go does not check enum exhaustiveness — so check any such switch
+  for a default branch that now needs a case.
 
 ## [0.1.0] - 2026-08-30
 

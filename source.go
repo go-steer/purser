@@ -81,6 +81,41 @@ const (
 	// from the gateway's plaintext headers, which any client that can
 	// reach the port may set.
 	AuthSourceIAP AuthSource = "iap"
+
+	// AuthSourceProxyHeader — the server read the identity from a
+	// header set by a fronting proxy and verified no credential of its
+	// own. This is the weakest source purser defines, and the only one
+	// whose trustworthiness rests entirely on deployment topology
+	// rather than on cryptography.
+	//
+	// It is worth naming rather than leaving consumers to mis-stamp.
+	// The oauth2-proxy / X-Forwarded-Email shape is the most common
+	// hosted deployment of anything behind an authenticating load
+	// balancer, and a server in that mode really has resolved a
+	// specific person and really will attribute their actions to them
+	// — so AuthSourceAnonymous is untrue. But it validated no
+	// signature, so AuthSourceIAP (which requires exactly that) is
+	// forbidden, and AuthSourceAsserted (which presumes a
+	// proxy-permitted credential underneath) has nothing to be
+	// permitted. An audit record reading "proxy-header" is a truthful
+	// statement about how much the identity is worth.
+	//
+	// Stamping it is a claim about the deployment, not about the
+	// request: that the fronting proxy strips client-supplied copies
+	// of the header, and that nothing else can reach the port. Neither
+	// is checkable from inside this process. A consumer that can
+	// verify a gateway's signature should stamp AuthSourceIAP instead,
+	// and downstream policy is entitled to treat this value as less
+	// trustworthy than any verified one.
+	//
+	// Note that this counts as authenticated everywhere purser tests
+	// for it, which is only AuthSourceAnonymous — so an authenticator
+	// reporting it may be wrapped by authz.WithRules and may reach
+	// httpmw's proxy-assertion path. Both are intended (mapping a
+	// header identity onto rules is the point), but they mean the
+	// operator's topology promise is load-bearing for authorization,
+	// not just for attribution.
+	AuthSourceProxyHeader AuthSource = "proxy-header"
 )
 
 // String implements fmt.Stringer.
@@ -95,7 +130,8 @@ func (s AuthSource) String() string { return string(s) }
 func (s AuthSource) Known() bool {
 	switch s {
 	case AuthSourceAnonymous, AuthSourceBearer, AuthSourceMTLS,
-		AuthSourceSPIFFE, AuthSourceOIDC, AuthSourceAsserted, AuthSourceIAP:
+		AuthSourceSPIFFE, AuthSourceOIDC, AuthSourceAsserted, AuthSourceIAP,
+		AuthSourceProxyHeader:
 		return true
 	default:
 		return false

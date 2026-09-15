@@ -1102,6 +1102,33 @@ report the wrong source. The
 property is preserved: the verdict is stamped by the code that performed
 the authentication and is never re-derived from spoofable headers.
 
+**`proxy-header` is the honest floor of the enum**
+([#17](https://github.com/go-steer/purser/issues/17)). A server behind an
+authenticating load balancer — the oauth2-proxy / `X-Forwarded-Email`
+shape, live today in `mast-web`'s `--auth-mode=proxy-header` — verifies
+no credential, yet does resolve a specific person and will attribute
+their actions to them. Every other value is a lie there: `iap` requires
+a validated gateway signature and says so, `asserted` presumes a
+proxy-permitted credential with nothing underneath it here, `anonymous`
+denies an attribution the server is about to make. The choice was
+between naming the mode and pushing consumers outside the contract, and
+`mast-web` demonstrated which one happens by default: it adopted
+`purser.Caller` but not `authn.Authenticator`, because implementing
+`Source()` meant picking a value it knew to be untrue.
+
+This does not weaken the hardening property above, though it sits close
+enough to it to be worth stating plainly. That property is that a
+*client* cannot choose its own verdict. Under this mode the verdict
+comes from the operator's static configuration — the mode the binary was
+started in — and the header supplies only the identity. A request cannot
+talk a bearer-configured server into stamping `proxy-header`, which is
+the attack the rule exists to stop. What the value *is* exposed to is a
+deployment error: a port reachable around the proxy, or a proxy that
+forwards a client-supplied copy of the header. Neither is checkable from
+inside the process, which is why the doc comment states the operator's
+obligation rather than implying a guarantee, and why downstream policy
+is entitled to treat the value as weaker than any verified one.
+
 ### `authtest` — the component-testing payoff
 
 The stated motivation for extraction, and the piece no single consumer

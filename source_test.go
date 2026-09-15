@@ -29,13 +29,14 @@ func TestAuthSourceWireValues(t *testing.T) {
 	t.Parallel()
 
 	want := map[purser.AuthSource]string{
-		purser.AuthSourceAnonymous: "anonymous",
-		purser.AuthSourceBearer:    "bearer",
-		purser.AuthSourceMTLS:      "mtls",
-		purser.AuthSourceSPIFFE:    "spiffe",
-		purser.AuthSourceOIDC:      "oidc",
-		purser.AuthSourceAsserted:  "asserted",
-		purser.AuthSourceIAP:       "iap",
+		purser.AuthSourceAnonymous:   "anonymous",
+		purser.AuthSourceBearer:      "bearer",
+		purser.AuthSourceMTLS:        "mtls",
+		purser.AuthSourceSPIFFE:      "spiffe",
+		purser.AuthSourceOIDC:        "oidc",
+		purser.AuthSourceAsserted:    "asserted",
+		purser.AuthSourceIAP:         "iap",
+		purser.AuthSourceProxyHeader: "proxy-header",
 	}
 	for src, str := range want {
 		if got := src.String(); got != str {
@@ -45,8 +46,30 @@ func TestAuthSourceWireValues(t *testing.T) {
 			t.Errorf("%q.Known() = false, want true", src)
 		}
 	}
-	if len(want) != 7 {
+	if len(want) != 8 {
 		t.Fatalf("test covers %d sources; update it alongside source.go", len(want))
+	}
+}
+
+// TestProxyHeaderIsDistinctFromVerifiedSources pins the property the
+// value exists for: a consumer in trusted-header mode must not be able
+// to land on a source that claims a signature was checked. Collapsing
+// any of these would erase exactly the distinction #17 asked for.
+func TestProxyHeaderIsDistinctFromVerifiedSources(t *testing.T) {
+	t.Parallel()
+
+	for _, verified := range []purser.AuthSource{
+		purser.AuthSourceIAP,
+		purser.AuthSourceAsserted,
+		purser.AuthSourceOIDC,
+		purser.AuthSourceMTLS,
+		purser.AuthSourceSPIFFE,
+		purser.AuthSourceBearer,
+		purser.AuthSourceAnonymous,
+	} {
+		if purser.AuthSourceProxyHeader == verified {
+			t.Errorf("AuthSourceProxyHeader == %q; it must stay distinguishable", verified)
+		}
 	}
 }
 
