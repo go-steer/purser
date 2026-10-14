@@ -65,7 +65,25 @@ type CallerOptions struct {
 	// Logger receives the rejected-assertion audit line. Nil means
 	// slog.Default().
 	Logger *slog.Logger
+
+	// Challenge is the WWW-Authenticate value sent with every 401 this
+	// middleware writes. Empty means `Bearer realm="purser"`.
+	//
+	// It exists for protected resources whose clients discover how to
+	// authenticate from the challenge: an MCP server names its RFC 9728
+	// metadata document there (`Bearer resource_metadata="https://…"`),
+	// and an MCP client that cannot find it cannot sign in. The value is
+	// sent verbatim. NewCaller refuses one that is not a valid header
+	// field value (RFC 9110 §5.5: no control bytes other than tab),
+	// because net/http would not refuse it either: HTTP/1 turns CR and
+	// LF into spaces, and the HTTP/2 server drops the header outright,
+	// so the client would get a 401 with no challenge at all.
+	Challenge string
 }
+
+// defaultChallenge is the WWW-Authenticate value when
+// CallerOptions.Challenge is empty.
+const defaultChallenge = `Bearer realm="purser"`
 
 // CallerMiddleware resolves each request's Caller and attaches it, the
 // proxying identity, and the auth-source verdict to the request context
@@ -84,6 +102,7 @@ type CallerMiddleware struct {
 	enforce       bool
 	proxyHeader   string
 	log           *slog.Logger
+	challenge     string
 }
 
 var _ Gate = (*CallerMiddleware)(nil)
@@ -171,12 +190,20 @@ func NewCaller(opts CallerOptions) (*CallerMiddleware, error) {
 		}
 	}
 
+	if !validFieldValue(opts.Challenge) {
+		return nil, fmt.Errorf("httpmw: NewCaller: Challenge %q is not a valid header value: it contains a control byte", opts.Challenge)
+	}
+
 	m := &CallerMiddleware{
 		authenticator: a,
 		fallback:      opts.Fallback,
 		enforce:       opts.Enforce,
 		proxyHeader:   opts.ProxyHeader,
 		log:           opts.Logger,
+		challenge:     opts.Challenge,
+	}
+	if m.challenge == "" {
+		m.challenge = defaultChallenge
 	}
 	if m.fallback.IsZero() {
 		m.fallback = purser.Anonymous()
@@ -229,7 +256,7 @@ func (m *CallerMiddleware) Middleware() Middleware {
 					m.log.WarnContext(r.Context(), "purser: proxy assertion rejected",
 						"requester", c.Identity, "authenticated", authenticated,
 						"asserted", raw, "err", err)
-					writeUnauthorized(w, err)
+					m.writeUnauthorized(w, err)
 					return
 				}
 				c, proxyBy, source = effective, by, purser.AuthSourceAsserted
@@ -254,7 +281,7 @@ func (m *CallerMiddleware) resolve(w http.ResponseWriter, r *http.Request) (purs
 	c, err := m.authenticator.Authenticate(r)
 	if err != nil {
 		if m.enforce {
-			writeUnauthorized(w, err)
+			m.writeUnauthorized(w, err)
 			return purser.Caller{}, "", false, false
 		}
 		// Cloned per request: the fallback is one value held by this
@@ -349,9 +376,9 @@ func (m *CallerMiddleware) resolveProxyAssertion(requester purser.Caller, authen
 // distinguishable from the outside by whether the request carried the
 // asserted-caller header. What stays out is anything the authenticator
 // said about *why* a credential failed — that is the operator's, and
-// it is on the log line.
-func writeUnauthorized(w http.ResponseWriter, err error) {
-	w.Header().Set("WWW-Authenticate", `Bearer realm="purser"`)
+// it is on the log line. The challenge is CallerOptions.Challenge.
+func (m *CallerMiddleware) writeUnauthorized(w http.ResponseWriter, err error) {
+	w.Header().Set("WWW-Authenticate", m.challenge)
 	msg := "unauthorized"
 	switch {
 	case errors.Is(err, purser.ErrAssertedCallerForbidden):
@@ -362,4 +389,18 @@ func writeUnauthorized(w http.ResponseWriter, err error) {
 		msg = "unauthorized: no valid credential"
 	}
 	http.Error(w, msg, http.StatusUnauthorized)
+}
+
+// validFieldValue reports whether v may be sent as an HTTP header value:
+// no control bytes except horizontal tab (RFC 9110 §5.5). Bytes at or
+// above 0x80 are obs-text and allowed. It checks bytes, not runes, the
+// way golang.org/x/net/http/httpguts.ValidHeaderFieldValue does, so an
+// invalid UTF-8 sequence is judged by what is actually on the wire.
+func validFieldValue(v string) bool {
+	for i := 0; i < len(v); i++ {
+		if b := v[i]; (b < 0x20 && b != '\t') || b == 0x7f {
+			return false
+		}
+	}
+	return true
 }

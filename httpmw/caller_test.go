@@ -182,6 +182,75 @@ func TestCallerFailedAuthFallsBackWhenNotEnforcing(t *testing.T) {
 	}
 }
 
+// TestCallerChallenge pins the WWW-Authenticate value on both paths that
+// write a 401: an enforced authentication failure, and a refused proxy
+// assertion. An MCP client reads resource_metadata from it to discover
+// how to sign in, so a path that sent the default instead would leave
+// that client stuck.
+func TestCallerChallenge(t *testing.T) {
+	t.Parallel()
+	const custom = `Bearer resource_metadata="https://lookout.example/.well-known/oauth-protected-resource/mcp"`
+	for _, c := range []struct{ challenge, want string }{
+		{"", `Bearer realm="purser"`},
+		{custom, custom},
+	} {
+		enforced := mustCaller(t, CallerOptions{Authenticator: tableAuth(t), Enforce: true, Challenge: c.challenge})
+		_, rec := serve(t, enforced, get())
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("enforced: status = %d, want 401", rec.Code)
+		}
+		if got := rec.Header().Get("WWW-Authenticate"); got != c.want {
+			t.Errorf("enforced, Challenge %q: WWW-Authenticate = %q, want %q", c.challenge, got, c.want)
+		}
+
+		// No credential plus an assertion: refused on the proxy path,
+		// which writes its own 401 even though Enforce is off.
+		lenient := mustCaller(t, CallerOptions{Authenticator: tableAuth(t), Challenge: c.challenge})
+		r := get()
+		r.Header.Set(authn.HeaderAssertedCaller, "alice@example.com")
+		_, rec = serve(t, lenient, r)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("proxy: status = %d, want 401", rec.Code)
+		}
+		if got := rec.Header().Get("WWW-Authenticate"); got != c.want {
+			t.Errorf("proxy, Challenge %q: WWW-Authenticate = %q, want %q", c.challenge, got, c.want)
+		}
+	}
+}
+
+// TestNewCallerChallengeMustBeAValidFieldValue pins the RFC 9110 §5.5
+// rule NewCaller applies, byte by byte as net/http's own check does: no
+// control bytes except tab; obs-text (bytes ≥ 0x80, valid UTF-8 or not)
+// is allowed.
+func TestNewCallerChallengeMustBeAValidFieldValue(t *testing.T) {
+	t.Parallel()
+	for _, c := range []struct {
+		name, challenge string
+		ok              bool
+	}{
+		{"header injection", "Bearer realm=\"x\"\r\nSet-Cookie: a=b", false},
+		{"trailing LF", "Bearer realm=\"x\"\n", false},
+		{"NUL", "Bearer \x00", false},
+		{"other C0", "Bearer \x1b", false},
+		{"DEL", "Bearer \x7f", false},
+		{"ordinary", `Bearer resource_metadata="https://x.example/m", scope="a b"`, true},
+		{"tab", "Bearer\trealm=\"x\"", true},
+		{"obs-text, valid UTF-8", "Bearer realm=\"café\"", true},
+		{"obs-text, raw byte", "Bearer realm=\"\x85\"", true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := NewCaller(CallerOptions{Challenge: c.challenge, Logger: discardLogger()})
+			if c.ok && err != nil {
+				t.Errorf("NewCaller refused %q: %v", c.challenge, err)
+			}
+			if !c.ok && err == nil {
+				t.Errorf("NewCaller accepted %q; want a control-byte error", c.challenge)
+			}
+		})
+	}
+}
+
 func TestCallerEnforceRejects(t *testing.T) {
 	t.Parallel()
 	mw := mustCaller(t, CallerOptions{Authenticator: tableAuth(t), Enforce: true})

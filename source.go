@@ -67,6 +67,20 @@ const (
 	// expiry.
 	AuthSourceOIDC AuthSource = "oidc"
 
+	// AuthSourceGoogleAccessToken — the server validated an opaque
+	// Google OAuth access token by asking Google (tokeninfo): unexpired,
+	// issued to one of the server's own OAuth clients, carrying the
+	// scopes it requires, for a verified account.
+	//
+	// Distinct from AuthSourceOIDC because no signature was checked: a
+	// Google access token is not a JWT, and its validity is Google's
+	// answer at lookup time, not a local verification against published
+	// keys. Distinct from AuthSourceBearer because the token is the
+	// caller's own Google credential, not an entry in a table the server
+	// provisioned, and the server may go on to act as the caller with it.
+	// Emitted by github.com/go-steer/steward.
+	AuthSourceGoogleAccessToken AuthSource = "google-access-token"
+
 	// AuthSourceAsserted — a proxy-permitted credential asserted
 	// another identity and the server validated the assertion. The
 	// asserted path is the audit-relevant source and outranks the
@@ -130,8 +144,8 @@ func (s AuthSource) String() string { return string(s) }
 func (s AuthSource) Known() bool {
 	switch s {
 	case AuthSourceAnonymous, AuthSourceBearer, AuthSourceMTLS,
-		AuthSourceSPIFFE, AuthSourceOIDC, AuthSourceAsserted, AuthSourceIAP,
-		AuthSourceProxyHeader:
+		AuthSourceSPIFFE, AuthSourceOIDC, AuthSourceGoogleAccessToken,
+		AuthSourceAsserted, AuthSourceIAP, AuthSourceProxyHeader:
 		return true
 	default:
 		return false

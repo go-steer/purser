@@ -29,14 +29,15 @@ func TestAuthSourceWireValues(t *testing.T) {
 	t.Parallel()
 
 	want := map[purser.AuthSource]string{
-		purser.AuthSourceAnonymous:   "anonymous",
-		purser.AuthSourceBearer:      "bearer",
-		purser.AuthSourceMTLS:        "mtls",
-		purser.AuthSourceSPIFFE:      "spiffe",
-		purser.AuthSourceOIDC:        "oidc",
-		purser.AuthSourceAsserted:    "asserted",
-		purser.AuthSourceIAP:         "iap",
-		purser.AuthSourceProxyHeader: "proxy-header",
+		purser.AuthSourceAnonymous:         "anonymous",
+		purser.AuthSourceBearer:            "bearer",
+		purser.AuthSourceMTLS:              "mtls",
+		purser.AuthSourceSPIFFE:            "spiffe",
+		purser.AuthSourceOIDC:              "oidc",
+		purser.AuthSourceGoogleAccessToken: "google-access-token",
+		purser.AuthSourceAsserted:          "asserted",
+		purser.AuthSourceIAP:               "iap",
+		purser.AuthSourceProxyHeader:       "proxy-header",
 	}
 	for src, str := range want {
 		if got := src.String(); got != str {
@@ -46,7 +47,7 @@ func TestAuthSourceWireValues(t *testing.T) {
 			t.Errorf("%q.Known() = false, want true", src)
 		}
 	}
-	if len(want) != 8 {
+	if len(want) != 9 {
 		t.Fatalf("test covers %d sources; update it alongside source.go", len(want))
 	}
 }
@@ -69,6 +70,25 @@ func TestProxyHeaderIsDistinctFromVerifiedSources(t *testing.T) {
 	} {
 		if purser.AuthSourceProxyHeader == verified {
 			t.Errorf("AuthSourceProxyHeader == %q; it must stay distinguishable", verified)
+		}
+	}
+}
+
+// TestGoogleAccessTokenIsDistinct pins why the value exists: an opaque
+// Google access token checked by asking Google is neither a verified
+// signature (oidc) nor a provisioned table entry (bearer), and a
+// consumer must be able to tell it from both.
+func TestGoogleAccessTokenIsDistinct(t *testing.T) {
+	t.Parallel()
+
+	for _, other := range []purser.AuthSource{
+		purser.AuthSourceOIDC,
+		purser.AuthSourceBearer,
+		purser.AuthSourceIAP,
+		purser.AuthSourceProxyHeader,
+	} {
+		if purser.AuthSourceGoogleAccessToken == other {
+			t.Errorf("AuthSourceGoogleAccessToken == %q; it must stay distinguishable", other)
 		}
 	}
 }

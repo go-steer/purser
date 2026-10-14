@@ -27,6 +27,26 @@ in [`CONTRIBUTING.md`](./CONTRIBUTING.md).
   A consumer that switches exhaustively on `AuthSource` will not fail to
   compile — Go does not check enum exhaustiveness — so check any such switch
   for a default branch that now needs a case.
+- `purser.AuthSourceGoogleAccessToken` (wire value `google-access-token`), for
+  a server that validated an opaque Google OAuth access token by asking Google:
+  unexpired, issued to one of the server's own OAuth clients, carrying the
+  scopes it requires, for a verified account. Neither existing value was true
+  of it: `oidc` means a signed JWT verified against published keys, and a
+  Google access token is not a JWT; `bearer` means an entry in a table the
+  server provisioned, and this is the caller's own Google credential, which the
+  server may go on to use as the caller. Emitted by
+  [steward](https://github.com/go-steer/steward), whose authenticator plugs
+  into `httpmw.CallerMiddleware`. The same exhaustive-switch note as above
+  applies.
+- `httpmw.CallerOptions.Challenge`, the `WWW-Authenticate` value on every 401
+  the caller middleware writes (empty keeps `Bearer realm="purser"`). A
+  protected resource can now name its RFC 9728 metadata document there
+  (`Bearer resource_metadata="…"`), which is how an MCP client discovers how
+  to sign in. It takes the whole header value rather than a realm, unlike
+  `TokenGateOptions.Realm`, because the parameter that matters here is not the
+  realm. `NewCaller` refuses a challenge that is not a valid header value
+  (any control byte other than tab): net/http would not refuse it either, and
+  its HTTP/2 server drops such a header, leaving a 401 with no challenge.
 
 ### Changed
 - **Go 1.26.9 is now the minimum.** govulncheck reports nine
