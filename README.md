@@ -13,7 +13,7 @@ that caller may perform an action.
 > dialling half in `client`, the HTTP middleware, OIDC, and the authorization
 > layer are in place, with a worked example under [`examples/`](./examples/)
 > and a per-package coverage floor holding them there. Tagged
-> [`v0.1.0`](./CHANGELOG.md) — pin that rather than a commit.
+> [`v0.2.0`](./CHANGELOG.md) — pin that rather than a commit.
 >
 > **Pre-1.0: the exported API may break at any minor version.** It has no
 > consumers yet, and phase 2 — migrating `core-agent` and `mast` onto it — is

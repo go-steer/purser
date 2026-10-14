@@ -12,6 +12,20 @@ in [`CONTRIBUTING.md`](./CONTRIBUTING.md).
 
 ## [Unreleased]
 
+*Nothing yet.*
+
+## [0.2.0] - 2026-10-14
+
+Two new credential classes and the hook a protected resource needs, all
+additive, plus a raised Go floor.
+
+**What v0.2.0 is for.** steward (go-steer/steward), the module that lets a
+service act as a caller holding a Google access token, plugs its
+authenticator into `httpmw.CallerMiddleware`; it needs
+`AuthSourceGoogleAccessToken` and `CallerOptions.Challenge`, and a tag to pin
+rather than a commit. `mast-web`'s trusted-header mode gets
+`AuthSourceProxyHeader` the same way.
+
 ### Added
 - `purser.AuthSourceProxyHeader` (wire value `proxy-header`), for a server that
   reads its caller's identity from a header set by a fronting proxy and
@@ -516,5 +530,6 @@ reported by apidiff, acknowledged in
   and why they verify with opposite `crypto/tls` idioms, the admission /
   identity split, the phase plan, and the verification each phase owes.
 
-[Unreleased]: https://github.com/go-steer/purser/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/go-steer/purser/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/go-steer/purser/releases/tag/v0.2.0
 [0.1.0]: https://github.com/go-steer/purser/releases/tag/v0.1.0
