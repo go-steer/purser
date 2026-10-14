@@ -125,7 +125,8 @@ suite, the bearer-token table, both mTLS profiles, `client`, `httpmw`,
 `authn/oidc`, and `authz` are all in, with a worked example under `examples/`
 and per-package coverage floors over the lot. Tagged `v0.1.0`, which is what
 gave `verify-apidiff` its first baseline — before that tag it skipped every
-run. Pre-1.0 the exported API may still break at a minor version, but it is
+run — and now `v0.2.0` (`proxy-header` and `google-access-token` auth
+sources, `CallerOptions.Challenge` for steward, Go 1.26.9). Pre-1.0 the exported API may still break at a minor version, but it is
 what phase 2 will migrate `core-agent` and `mast` onto, so changing it is a
 design conversation, not a refactor — and never a silent one. Phase 1b
 (service-mesh / sidecar-terminated TLS) is optional and unstarted; see the
