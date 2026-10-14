@@ -28,6 +28,14 @@ in [`CONTRIBUTING.md`](./CONTRIBUTING.md).
   compile — Go does not check enum exhaustiveness — so check any such switch
   for a default branch that now needs a case.
 
+### Changed
+- **Go 1.26.9 is now the minimum.** govulncheck reports nine
+  standard-library vulnerabilities reachable from purser under 1.26.6
+  (`net/http`, `crypto/tls` and others). A module's `go` directive is the
+  floor for everything that imports it, so a consumer on 1.26.6 must move to
+  1.26.9 to take the next release — which it needs for the same advisories
+  regardless.
+
 ## [0.1.0] - 2026-08-30
 
 Phase 1a: the whole of the authentication and authorization layer, with no
