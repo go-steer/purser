@@ -1129,6 +1129,25 @@ inside the process, which is why the doc comment states the operator's
 obligation rather than implying a guarantee, and why downstream policy
 is entitled to treat the value as weaker than any verified one.
 
+**`google-access-token` is verified, but not by a signature.** A
+service that a Gemini Enterprise app calls receives each user's own
+Google OAuth access token, and checks it by asking Google (tokeninfo,
+userinfo): unexpired, issued to the service's own OAuth client,
+carrying the scopes it requires, for a verified account. That is a real
+verification, so `anonymous` and `proxy-header` are wrong; but there is
+no signature, because a Google access token is opaque, so `oidc` is
+wrong; and the credential is the caller's own Google grant rather than
+a provisioned table entry, which the service may go on to use *as* the
+caller, so `bearer` is wrong too. The authenticator that emits it lives
+in [steward](https://github.com/go-steer/steward), which exists because
+two Google-specific jobs fall outside this module: checking an opaque
+token by asking Google, and running an authorization code flow, which
+the `authn/oidc` section above excludes. steward implements
+`authn.Authenticator`, so its callers reach a service through
+`httpmw.CallerMiddleware` like any other, and the one addition that
+middleware needs for this case, `CallerOptions.Challenge`, lets a
+protected resource name its RFC 9728 metadata in the 401.
+
 ### `authtest` — the component-testing payoff
 
 The stated motivation for extraction, and the piece no single consumer
