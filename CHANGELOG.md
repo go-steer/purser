@@ -12,6 +12,10 @@ in [`CONTRIBUTING.md`](./CONTRIBUTING.md).
 
 ## [Unreleased]
 
+*Nothing yet.*
+
+## [0.3.0] - 2026-10-20
+
 ### Added
 - `purser.ErrUnavailable`: the sentinel for an authenticator that could not
   reach a verdict at all — the issuer's keys would not load, the endpoint it
@@ -570,6 +574,7 @@ reported by apidiff, acknowledged in
   and why they verify with opposite `crypto/tls` idioms, the admission /
   identity split, the phase plan, and the verification each phase owes.
 
-[Unreleased]: https://github.com/go-steer/purser/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/go-steer/purser/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/go-steer/purser/releases/tag/v0.3.0
 [0.2.0]: https://github.com/go-steer/purser/releases/tag/v0.2.0
 [0.1.0]: https://github.com/go-steer/purser/releases/tag/v0.1.0
