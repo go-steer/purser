@@ -12,7 +12,19 @@ in [`CONTRIBUTING.md`](./CONTRIBUTING.md).
 
 ## [Unreleased]
 
-*Nothing yet.*
+### Changed
+- `httpmw.CallerMiddleware` removes the request's own credential from an
+  authenticator's error before logging it. v0.3.0 began logging those errors —
+  at Warn for an authenticator that could not reach a verdict, at Debug for a
+  rejected credential — and the authenticator need not be purser's: one that
+  quotes the token it was handed would have put a live credential in the log.
+  What is removed: the `Authorization` value, whole and with its scheme
+  stripped, and `X-Attach-Token`, each as sent and in both URL encodings. It is
+  a backstop rather than a guarantee — a credential from another header, or
+  one transformed before it was quoted, passes through, and values under eight
+  bytes are left alone. purser's own authenticators and steward's never quote
+  the credential, so for them nothing changes. Suggested in review of
+  [#24](https://github.com/go-steer/purser/pull/24).
 
 ## [0.3.0] - 2026-10-20
 

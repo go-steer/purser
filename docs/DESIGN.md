@@ -1204,6 +1204,17 @@ is not an outage. Canceled specifically: a server-side deadline ends the
 context with `DeadlineExceeded`, and a dependency slow enough to trip
 one is the outage.
 
+Those lines record the authenticator's error, which purser did not
+write and cannot vouch for: a third-party authenticator that quotes the
+token it rejected would put a live credential in the log. So the
+request's own credential is removed first — `Authorization`, whole and
+without its scheme, and `X-Attach-Token`, as sent and in both URL
+encodings. This is a backstop, not a guarantee: a credential read from
+another header, or transformed before it was quoted, passes through, and
+values under eight bytes are left alone rather than redacting every word
+that contains them. Not quoting the credential stays the
+authenticator's job; this makes the common mistake harmless.
+
 Without `Enforce` the request still falls back, as it always has, and
 the Warn is the only trace that a signed-in user was served as the
 fallback for the length of the outage. Whether a surface that permits
