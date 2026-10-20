@@ -12,6 +12,12 @@ in [`CONTRIBUTING.md`](./CONTRIBUTING.md).
 
 ## [Unreleased]
 
+*Nothing yet.*
+
+## [0.4.0] - 2026-10-20
+
+The two gaps #24 left open are closed: a credential the authenticator could not check is a 503 even with `Enforce` off, instead of being served as Fallback (#29); and a proxy assertion whose identity lookup could not tell is a 503, not a 401 (#28). The second needs a breaking change: `authn.IdentityLookup.LookupIdentity` takes the request's context and returns an error. Nothing outside purser implements or calls it today.
+
 ### Changed
 - **Breaking: `authn.IdentityLookup.LookupIdentity` returns an error and takes
   a context.** It was `LookupIdentity(identity string) (purser.Caller, bool)`;
@@ -635,7 +641,8 @@ reported by apidiff, acknowledged in
   and why they verify with opposite `crypto/tls` idioms, the admission /
   identity split, the phase plan, and the verification each phase owes.
 
-[Unreleased]: https://github.com/go-steer/purser/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/go-steer/purser/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/go-steer/purser/releases/tag/v0.4.0
 [0.3.1]: https://github.com/go-steer/purser/releases/tag/v0.3.1
 [0.3.0]: https://github.com/go-steer/purser/releases/tag/v0.3.0
 [0.2.0]: https://github.com/go-steer/purser/releases/tag/v0.2.0
