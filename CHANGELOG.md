@@ -12,6 +12,12 @@ in [`CONTRIBUTING.md`](./CONTRIBUTING.md).
 
 ## [Unreleased]
 
+*Nothing yet.*
+
+## [0.3.1] - 2026-10-20
+
+The request's own credential is removed from an authenticator's error before `httpmw` logs it, a backstop for authenticators that quote the token they rejected. No API change.
+
 ### Changed
 - `httpmw.CallerMiddleware` removes the request's own credential from an
   authenticator's error before logging it. v0.3.0 began logging those errors —
@@ -596,7 +602,8 @@ reported by apidiff, acknowledged in
   and why they verify with opposite `crypto/tls` idioms, the admission /
   identity split, the phase plan, and the verification each phase owes.
 
-[Unreleased]: https://github.com/go-steer/purser/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/go-steer/purser/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/go-steer/purser/releases/tag/v0.3.1
 [0.3.0]: https://github.com/go-steer/purser/releases/tag/v0.3.0
 [0.2.0]: https://github.com/go-steer/purser/releases/tag/v0.2.0
 [0.1.0]: https://github.com/go-steer/purser/releases/tag/v0.1.0
