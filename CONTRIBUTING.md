@@ -55,7 +55,9 @@ To make a deliberate break:
 3. Commit both in the PR that makes the change, and record it under
    *Changed* or *Removed* in `CHANGELOG.md`.
 
-Cutting a release empties the file: once the tag moves, those breaks sit
+The file is emptied once the release that contains the breaks is tagged —
+step 7 of "Cutting a release", not the release PR itself, whose apidiff
+check still compares against the previous tag. After that, those breaks sit
 behind the new baseline, and a leftover entry would silently permit a
 second, unrelated removal.
 

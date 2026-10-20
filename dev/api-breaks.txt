@@ -13,8 +13,11 @@
 # breaks the symbol, that the break is intended and written down. Record
 # the same change under Changed or Removed in CHANGELOG.md.
 #
-# Cutting a release empties this file: once the tag moves, these breaks
-# sit behind the new baseline, and a leftover entry would silently permit
-# a second, unrelated removal of a symbol that no longer exists.
+# Emptied in a follow-up PR once the release containing these breaks is
+# tagged — not in the release PR, whose apidiff check still compares
+# against the previous tag (CONTRIBUTING.md, "Cutting a release", step 7).
+# After that the breaks sit behind the new baseline, and a leftover entry
+# would silently permit a second, unrelated removal of a symbol that no
+# longer exists.
 #
 # (empty — nothing has been broken since v0.4.0)

@@ -12,12 +12,14 @@ that caller may perform an action.
 > bearer-token table, both mTLS profiles — standard-CA and SPIFFE — the
 > dialling half in `client`, the HTTP middleware, OIDC, and the authorization
 > layer are in place, with a worked example under [`examples/`](./examples/)
-> and a per-package coverage floor holding them there. Tagged
-> [`v0.2.0`](./CHANGELOG.md) — pin that rather than a commit.
+> and a per-package coverage floor holding them there. Pin a release tag
+> rather than a commit; [`CHANGELOG.md`](./CHANGELOG.md) lists them, newest
+> first.
 >
-> **Pre-1.0: the exported API may break at any minor version.** It has no
-> consumers yet, and phase 2 — migrating `core-agent` and `mast` onto it — is
-> the thing most likely to change it. Breaks are never silent: each one is
+> **Pre-1.0: the exported API may break at any minor version.** `steward`,
+> `k8s-lookout` and `mast-web` already depend on it, and phase 2 — migrating
+> `core-agent` and `mast` onto it — is the thing most likely to change it
+> further. Breaks are never silent: each one is
 > reported by `dev/tools/verify-apidiff`, acknowledged in
 > [`dev/api-breaks.txt`](./dev/api-breaks.txt), and listed under *Changed* or
 > *Removed* in [`CHANGELOG.md`](./CHANGELOG.md).
