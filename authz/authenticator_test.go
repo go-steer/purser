@@ -15,6 +15,7 @@
 package authz_test
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -215,16 +216,40 @@ func TestWithRulesAppliesRulesToLookupIdentity(t *testing.T) {
 		t.Fatal("wrapping bearer.Auth dropped authn.IdentityLookup")
 	}
 
-	c, found := lookup.LookupIdentity(aliceID)
-	if !found {
-		t.Fatalf("LookupIdentity(%q) not found", aliceID)
+	c, err := lookup.LookupIdentity(context.Background(), aliceID)
+	if err != nil {
+		t.Fatalf("LookupIdentity(%q) = %v", aliceID, err)
 	}
 	if !c.Admin {
 		t.Error("an identity reached by lookup did not get the grant it gets by authenticating; " +
 			"proxying to a caller must not change what that caller is")
 	}
-	if _, found := lookup.LookupIdentity(strangerID); found {
-		t.Errorf("LookupIdentity(%q) resolved an identity nobody provisioned", strangerID)
+	if _, err := lookup.LookupIdentity(context.Background(), strangerID); !errors.Is(err, purser.ErrAssertedCallerUnknown) {
+		t.Errorf("LookupIdentity(%q) = %v, want purser.ErrAssertedCallerUnknown", strangerID, err)
+	}
+}
+
+// The wrapper passes a lookup's error through as it is, so httpmw can
+// still tell not-provisioned (401) from could-not-tell (503) — #28 —
+// and never hands on a Caller alongside it, whatever the wrapped
+// implementation returned: applying rules to an identity that did not
+// resolve would grant on the strength of nothing.
+func TestWithRulesPassesLookupErrorsThrough(t *testing.T) {
+	t.Parallel()
+
+	wrapped, err := authz.WithRules(outageLookup{}, newRules(t))
+	if err != nil {
+		t.Fatalf("WithRules: %v", err)
+	}
+	c, err := wrapped.(authn.IdentityLookup).LookupIdentity(context.Background(), aliceID)
+	if !errors.Is(err, purser.ErrUnavailable) {
+		t.Errorf("LookupIdentity = %v, want the wrapped purser.ErrUnavailable", err)
+	}
+	if errors.Is(err, purser.ErrAssertedCallerUnknown) {
+		t.Errorf("LookupIdentity = %v: an outage came back as not-provisioned", err)
+	}
+	if !c.IsZero() {
+		t.Errorf("LookupIdentity returned %q alongside an error", c.Identity)
 	}
 }
 
@@ -546,7 +571,17 @@ func (plainAuth) Source() purser.AuthSource { return purser.AuthSourceBearer }
 
 type lookupAuth struct{ plainAuth }
 
-func (lookupAuth) LookupIdentity(string) (purser.Caller, bool) { return purser.Caller{}, false }
+func (lookupAuth) LookupIdentity(context.Context, string) (purser.Caller, error) {
+	return purser.Caller{}, purser.ErrAssertedCallerUnknown
+}
+
+// outageLookup is a lookup whose store did not answer — and which,
+// against its contract, returns a Caller alongside the error.
+type outageLookup struct{ plainAuth }
+
+func (outageLookup) LookupIdentity(context.Context, string) (purser.Caller, error) {
+	return purser.Caller{Identity: aliceID}, fmt.Errorf("directory: connection refused: %w", purser.ErrUnavailable)
+}
 
 type gateAuth struct {
 	plainAuth

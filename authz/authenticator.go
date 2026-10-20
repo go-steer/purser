@@ -15,6 +15,7 @@
 package authz
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -162,13 +163,16 @@ var _ authn.IdentityLookup = ruleAuthLookup{}
 
 // LookupIdentity resolves a provisioned identity and applies the rules
 // to it, so an identity reached by proxy carries the same grants it
-// would have carried had it authenticated directly.
-func (w ruleAuthLookup) LookupIdentity(identity string) (purser.Caller, bool) {
-	c, ok := w.lookup.LookupIdentity(identity)
-	if !ok {
-		return purser.Caller{}, false
+// would have carried had it authenticated directly. An error passes
+// through untouched — not provisioned and could-not-tell stay
+// distinguishable — and never with a Caller alongside it, whatever the
+// wrapped implementation returned.
+func (w ruleAuthLookup) LookupIdentity(ctx context.Context, identity string) (purser.Caller, error) {
+	c, err := w.lookup.LookupIdentity(ctx, identity)
+	if err != nil {
+		return purser.Caller{}, err
 	}
-	return w.rules.Apply(c), true
+	return w.rules.Apply(c), nil
 }
 
 // ruleAuthGate is the variant for a wrapped authenticator that declares

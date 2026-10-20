@@ -27,6 +27,7 @@
 package authtest
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -132,20 +133,25 @@ func (a *refAuth) Authenticate(r *http.Request) (purser.Caller, error) {
 
 func (a *refAuth) CanProxyAs(c purser.Caller) bool { return c.Identity == proxyIdentity }
 
-func (a *refAuth) LookupIdentity(identity string) (purser.Caller, bool) {
+func (a *refAuth) LookupIdentity(_ context.Context, identity string) (purser.Caller, error) {
 	if identity == "" {
-		return purser.Caller{}, false
+		return purser.Caller{}, unknown(identity)
 	}
 	for _, c := range a.table {
 		if c.Identity != identity {
 			continue
 		}
 		if a.clone {
-			return c.Clone(), true
+			return c.Clone(), nil
 		}
-		return c, true
+		return c, nil
 	}
-	return purser.Caller{}, false
+	return purser.Caller{}, unknown(identity)
+}
+
+// unknown is the not-provisioned answer an honest IdentityLookup gives.
+func unknown(identity string) error {
+	return fmt.Errorf("%q is not provisioned: %w", identity, purser.ErrAssertedCallerUnknown)
 }
 
 var (
@@ -217,10 +223,10 @@ func (s stubProxy) CanProxyAs(c purser.Caller) bool { return s.canProxyFn(c) }
 
 type stubLookup struct {
 	stubAuth
-	lookupFn func(string) (purser.Caller, bool)
+	lookupFn func(string) (purser.Caller, error)
 }
 
-func (s stubLookup) LookupIdentity(identity string) (purser.Caller, bool) {
+func (s stubLookup) LookupIdentity(_ context.Context, identity string) (purser.Caller, error) {
 	return s.lookupFn(identity)
 }
 
@@ -574,12 +580,12 @@ func TestCheckLabelsNotAliasedCoversTheLookupPath(t *testing.T) {
 		stubAuth: stubAuth{authFn: func(r *http.Request) (purser.Caller, error) {
 			return honest.Authenticate(r) // clones, so only the lookup path is broken
 		}},
-		lookupFn: func(id string) (purser.Caller, bool) {
+		lookupFn: func(id string) (purser.Caller, error) {
 			c, ok := honest.table[refToken]
 			if !ok || c.Identity != id {
-				return purser.Caller{}, false
+				return purser.Caller{}, unknown(id)
 			}
-			return c, true // the raw table entry
+			return c, nil // the raw table entry
 		},
 	})
 	wantReported(t, runCheck(t, "LabelsNotAliased", s),
@@ -600,12 +606,12 @@ func TestCheckLabelsNotAliasedDetectsAbsentProvisionedIdentity(t *testing.T) {
 func TestCheckLabelsNotAliasedDetectsZeroLookupResult(t *testing.T) {
 	t.Parallel()
 
-	s := refSubject(stubLookup{lookupFn: func(string) (purser.Caller, bool) {
-		return purser.Caller{}, true
+	s := refSubject(stubLookup{lookupFn: func(string) (purser.Caller, error) {
+		return purser.Caller{}, nil
 	}})
 	s.ProvisionedIdentity = refIdentity
 	wantReported(t, runCheck(t, "LabelsNotAliased", s),
-		"reports found=true with a zero Caller")
+		"reports success with a zero Caller")
 }
 
 func TestCheckLabelsNotAliasedIgnoresLabellessCallers(t *testing.T) {
@@ -687,18 +693,30 @@ func TestCheckUnknownAssertedIdentityDetectsInventedCallers(t *testing.T) {
 
 	tests := []struct {
 		name   string
-		lookup func(string) (purser.Caller, bool)
+		lookup func(string) (purser.Caller, error)
 		broken string
 	}{
-		{"resolves anything", func(id string) (purser.Caller, bool) {
-			return purser.Caller{Identity: id}, true
+		{"resolves anything", func(id string) (purser.Caller, error) {
+			return purser.Caller{Identity: id}, nil
 		}, "invents a Caller for any identity it is asked about"},
-		{"resolves the empty identity", func(id string) (purser.Caller, bool) {
-			return purser.Caller{Identity: refIdentity}, id == ""
+		{"resolves the empty identity", func(id string) (purser.Caller, error) {
+			if id == "" {
+				return purser.Caller{Identity: refIdentity}, nil
+			}
+			return purser.Caller{}, unknown(id)
 		}, "resolves the empty identity"},
-		{"caller alongside not-found", func(string) (purser.Caller, bool) {
-			return purser.Caller{Identity: refIdentity}, false
-		}, "returns a populated Caller with found=false"},
+		{"caller alongside an error", func(id string) (purser.Caller, error) {
+			return purser.Caller{Identity: refIdentity}, unknown(id)
+		}, "returns a populated Caller alongside not-provisioned"},
+		// #28: absence is a verdict. A bare error, or one that also
+		// claims unavailability, would draw a 503 in httpmw and tell the
+		// asserting proxy to retry an identity that will never exist.
+		{"wrong sentinel", func(string) (purser.Caller, error) {
+			return purser.Caller{}, errors.New("no such user")
+		}, "reports absence without wrapping ErrAssertedCallerUnknown"},
+		{"unavailable alongside the verdict", func(id string) (purser.Caller, error) {
+			return purser.Caller{}, errors.Join(unknown(id), purser.ErrUnavailable)
+		}, "wraps ErrUnavailable alongside not-provisioned"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -716,11 +734,11 @@ func TestCheckUnknownAssertedIdentityHonorsSubjectSuppliedIdentity(t *testing.T)
 	// The suite's own probe identity is deliberately unrealistic; a
 	// table that only rejects unrealistic identities must still be
 	// caught by the one the subject names.
-	s := refSubject(stubLookup{lookupFn: func(id string) (purser.Caller, bool) {
+	s := refSubject(stubLookup{lookupFn: func(id string) (purser.Caller, error) {
 		if id == unprovisioned || id == "" {
-			return purser.Caller{}, false
+			return purser.Caller{}, unknown(id)
 		}
-		return purser.Caller{Identity: id}, true
+		return purser.Caller{Identity: id}, nil
 	}})
 	s.UnprovisionedIdentity = "bob@example.com"
 	wantReported(t, runCheck(t, "UnknownAssertedIdentity", s),

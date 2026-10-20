@@ -1176,12 +1176,12 @@ OAuth. During an outage on the server's side that sends every user back
 through sign-in at once, for credentials that were fine, while the
 operator sees nothing.
 
-So under `Enforce`:
+So:
 
 | Authenticator returned | Response |
 |---|---|
-| `ErrUnauthenticated` | 401, `WWW-Authenticate: <Challenge>`, logged at Debug |
-| `ErrUnavailable` | 503, `Retry-After`, no challenge, logged at Warn |
+| `ErrUnauthenticated` | under `Enforce`, 401, `WWW-Authenticate: <Challenge>`, logged at Debug; without it, the fallback |
+| `ErrUnavailable` | 503, `Retry-After`, no challenge, logged at Warn — with or without `Enforce` |
 | anything else | the same as `ErrUnavailable` |
 | both sentinels | the same as `ErrUnavailable` |
 
@@ -1215,12 +1215,36 @@ values under eight bytes are left alone rather than redacting every word
 that contains them. Not quoting the credential stays the
 authenticator's job; this makes the common mistake harmless.
 
-Without `Enforce` the request still falls back, as it always has, and
-the Warn is the only trace that a signed-in user was served as the
-fallback for the length of the outage. Whether a surface that permits
-anonymous access should instead refuse a credential it could not check
-is an open question; it is left as it was because downgrading to less
-privilege fails safe, and changing it is a separate decision.
+**Without `Enforce` the 503 still applies**
+([#29](https://github.com/go-steer/purser/issues/29)). #23 first left
+that case falling back, on the grounds that downgrading to less
+privilege fails safe. But a 503 fails safe too, and only one of them is
+true. Only a client that presented a credential can draw
+`ErrUnavailable` — no credential is `ErrUnauthenticated` by the
+`Authenticator` contract, and the conformance suite forbids
+`ErrUnavailable` alongside it — so the fallback was only ever reached
+here by someone who asked to be themselves. Serving them as the fallback
+attributed their request to nobody and showed them a view with their
+own state missing, with nothing in a 200 to say that retrying would fix
+it. Anonymous traffic is untouched: no credential still falls back.
+There is no option to restore the old behavior; a client that wants
+anonymous access during an outage can leave its credential off, and an
+option can be added when a consumer needs degraded-anonymous service.
+
+**The proxy path draws the same line**
+([#28](https://github.com/go-steer/purser/issues/28)).
+`authn.IdentityLookup.LookupIdentity` returned a found bit, so a lookup
+backed by a directory could only answer "not provisioned" when the
+directory did not answer, and the asserting proxy got a 401
+`ErrAssertedCallerUnknown` — "nobody by that name". It now returns an
+error and takes the request's context: `ErrAssertedCallerUnknown` is the
+verdict and a 401, `ErrUnavailable` (or an error matching neither proxy
+sentinel) a 503, with the same precedence as above. That was an
+incompatible change to an exported interface, made pre-1.0 while nothing
+outside purser implemented it; core-agent's and mast's own
+`LookupIdentity` adopt the new shape when phase 2 moves them onto purser.
+The suite holds "not provisioned" to `ErrAssertedCallerUnknown`, without
+`ErrUnavailable` beside it.
 
 ### `authtest` — the component-testing payoff
 

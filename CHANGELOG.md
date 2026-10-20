@@ -12,7 +12,40 @@ in [`CONTRIBUTING.md`](./CONTRIBUTING.md).
 
 ## [Unreleased]
 
-*Nothing yet.*
+### Changed
+- **Breaking: `authn.IdentityLookup.LookupIdentity` returns an error and takes
+  a context.** It was `LookupIdentity(identity string) (purser.Caller, bool)`;
+  it is now `LookupIdentity(ctx context.Context, identity string)
+  (purser.Caller, error)`. Not provisioned (including `""`) is an error wrapping
+  `purser.ErrAssertedCallerUnknown`; a lookup that could not tell — the
+  directory behind it did not answer — returns one wrapping
+  `purser.ErrUnavailable`. The found bit could only say "not provisioned", so a
+  proxy assertion during a directory outage drew a 401 telling the asserting
+  proxy that nobody by that name existed; and with no context, a remote lookup
+  could not honor the request's cancellation. `authn/bearer.(*Auth)` follows.
+  **Migrating:** return `c, nil` for `c, true`, and an error wrapping
+  `purser.ErrAssertedCallerUnknown` for `_, false`; callers switch from
+  `if !ok` to `if err != nil`. No implementation outside purser exists today.
+  ([#28](https://github.com/go-steer/purser/issues/28))
+- `httpmw.CallerMiddleware` answers a proxy assertion whose
+  `IdentityLookup` could not tell with 503, `Retry-After` and no challenge,
+  logged at Warn, rather than 401 `ErrAssertedCallerUnknown`. A lookup that
+  reports success with a zero `Caller` is refused as unprovisioned.
+  ([#28](https://github.com/go-steer/purser/issues/28))
+- **`httpmw.CallerMiddleware` answers 503 for a credential it could not check
+  even without `Enforce`.** v0.3.0 made that a 503 under `Enforce` and left a
+  non-enforcing surface falling back to `Fallback`. Only a client that
+  presented a credential can get there — no credential is
+  `ErrUnauthenticated`, by contract — so the fallback served someone who asked
+  to be themselves as nobody, with their own state missing and nothing telling
+  them to retry. No credential still falls back, so anonymous traffic is
+  unaffected; `GatesCredentials` is unchanged. **Check before upgrading:** as
+  under `Enforce` since v0.3.0, an authenticator that reports a bad credential
+  with a bare error, not `ErrUnauthenticated`, now draws a 503 on a
+  non-enforcing surface too. ([#29](https://github.com/go-steer/purser/issues/29))
+- `authtest.RunAuthenticatorSuite` holds `LookupIdentity` of an unprovisioned
+  identity to `purser.ErrAssertedCallerUnknown`, and rejects one that also
+  wraps `purser.ErrUnavailable`.
 
 ## [0.3.1] - 2026-10-20
 

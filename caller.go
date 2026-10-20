@@ -133,7 +133,10 @@ var ErrUnavailable = errors.New("purser: authentication unavailable")
 var ErrAssertedCallerForbidden = errors.New("purser: caller is not permitted to assert identities")
 
 // ErrAssertedCallerUnknown is returned when a proxy-permitted Caller
-// asserts an identity that is not provisioned. Surfaces map it to 401.
+// asserts an identity that is not provisioned, including by
+// authn.IdentityLookup implementations reporting that they do not hold
+// it. Surfaces map it to 401. A lookup that could not tell returns
+// ErrUnavailable instead, never both.
 var ErrAssertedCallerUnknown = errors.New("purser: asserted identity is not provisioned")
 
 type callerKey struct{}

@@ -30,6 +30,7 @@
 package bearer
 
 import (
+	"context"
 	"crypto/sha256"
 	"errors"
 	"fmt"
@@ -161,16 +162,22 @@ func (a *Auth) CanProxyAs(c purser.Caller) bool {
 
 // LookupIdentity returns the Caller provisioned under identity,
 // carrying the Labels and Admin flag a direct authentication would have
-// produced. ok is false when the identity is not in the table.
-func (a *Auth) LookupIdentity(identity string) (purser.Caller, bool) {
+// produced, or an error wrapping purser.ErrAssertedCallerUnknown when
+// the identity is not in the table. The table is in memory, so it never
+// returns purser.ErrUnavailable, and ctx is unused.
+func (a *Auth) LookupIdentity(_ context.Context, identity string) (purser.Caller, error) {
 	if identity == "" {
-		return purser.Caller{}, false
+		return purser.Caller{}, fmt.Errorf("purser/bearer: empty identity: %w", purser.ErrAssertedCallerUnknown)
 	}
 	c, ok := a.byIdentity[identity]
 	if !ok {
-		return purser.Caller{}, false
+		// The identity is not quoted. It is the asserting client's
+		// string — httpmw logs it already, as an attribute — and a
+		// client asserting a token, which TestLookupIdentityDoesNotTakeTokens
+		// covers, would otherwise have it repeated in the error text.
+		return purser.Caller{}, fmt.Errorf("purser/bearer: identity is not in the table: %w", purser.ErrAssertedCallerUnknown)
 	}
-	return c.Clone(), true
+	return c.Clone(), nil
 }
 
 // Len reports how many identities the table holds. Useful to a surface

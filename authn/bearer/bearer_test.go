@@ -15,6 +15,7 @@
 package bearer_test
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -461,9 +462,9 @@ func TestLookupIdentity(t *testing.T) {
 
 	a := fixture(t)
 
-	c, ok := a.LookupIdentity(aliceIdentity)
-	if !ok {
-		t.Fatalf("LookupIdentity(%q) = not found", aliceIdentity)
+	c, err := a.LookupIdentity(context.Background(), aliceIdentity)
+	if err != nil {
+		t.Fatalf("LookupIdentity(%q) = %v", aliceIdentity, err)
 	}
 	// The asserted caller must carry everything a direct
 	// authentication would have: a proxied admin who arrives without
@@ -480,8 +481,13 @@ func TestLookupIdentity(t *testing.T) {
 	}
 
 	for _, id := range []string{"", "dave@example.com", aliceToken} {
-		if got, ok := a.LookupIdentity(id); ok {
-			t.Errorf("LookupIdentity(%q) = (%q, true), want not found", id, got.Identity)
+		got, err := a.LookupIdentity(context.Background(), id)
+		if !errors.Is(err, purser.ErrAssertedCallerUnknown) {
+			t.Errorf("LookupIdentity(%q) = (%q, %v), want purser.ErrAssertedCallerUnknown", id, got.Identity, err)
+		}
+		// An in-memory table always knows; it never reports an outage.
+		if errors.Is(err, purser.ErrUnavailable) {
+			t.Errorf("LookupIdentity(%q) error = %v matches ErrUnavailable", id, err)
 		}
 	}
 }
@@ -493,8 +499,8 @@ func TestLookupIdentityDoesNotTakeTokens(t *testing.T) {
 	t.Parallel()
 
 	a := fixture(t)
-	if c, ok := a.LookupIdentity(aliceToken); ok {
-		t.Errorf("LookupIdentity(<a token>) = (%q, true), want not found", c.Identity)
+	if c, err := a.LookupIdentity(context.Background(), aliceToken); err == nil {
+		t.Errorf("LookupIdentity(<a token>) = %q, want not provisioned", c.Identity)
 	}
 }
 
