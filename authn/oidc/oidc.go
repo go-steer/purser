@@ -29,6 +29,13 @@
 // claim — is purser.ErrUnauthenticated, so a surface maps the lot to
 // 401.
 //
+// The one exception is a token that cannot be judged because the
+// issuer's keys cannot be obtained: discovery or the key fetch failed
+// and nothing cached matches. That is purser.ErrUnavailable, a 503,
+// because it says nothing about the token — and a client told 401 signs
+// in again, which during an IdP outage sends every user back through a
+// sign-in the IdP cannot serve either.
+//
 // # What this package does not do
 //
 // It does not implement the OAuth 2.0 authorization code flow. It
@@ -63,6 +70,7 @@
 package oidc
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -371,7 +379,8 @@ func New(opts Options) (*Auth, error) {
 // Caller.
 //
 // Every failure is purser.ErrUnauthenticated with a message naming what
-// was wrong. The message is for the server's log: an HTTP surface
+// was wrong, except that issuer keys which cannot be obtained are
+// purser.ErrUnavailable. The message is for the server's log: an HTTP surface
 // returns 401 and the sentinel, not the reason, because "wrong
 // audience" and "expired" are useful to someone probing what this
 // service accepts and useless to a client that must obtain a fresh
@@ -418,6 +427,12 @@ func (a *Auth) verifySignature(r *http.Request, raw string) ([]byte, error) {
 
 	keys, err := a.keys.keysFor(r.Context(), sig.Header.KeyID, sig.Header.Algorithm)
 	if err != nil {
+		if errors.Is(err, purser.ErrUnavailable) {
+			// Not ErrUnauthenticated as well: an error matching both
+			// is a 503 anyway, and the claim would be false. See the
+			// package doc.
+			return nil, fmt.Errorf("purser/oidc: %w", err)
+		}
 		return nil, fmt.Errorf("purser/oidc: %v: %w", err, purser.ErrUnauthenticated)
 	}
 	for i := range keys {

@@ -15,6 +15,7 @@
 package httpmw
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -37,16 +38,18 @@ type CallerOptions struct {
 	Authenticator authn.Authenticator
 
 	// Fallback is the Caller a request falls back to when the
-	// authenticator reports purser.ErrUnauthenticated and Enforce is
-	// false. A zero Fallback means purser.Anonymous().
+	// authenticator returns any error and Enforce is false. A zero
+	// Fallback means purser.Anonymous().
 	//
 	// It is refused alongside Enforce, which has no fallback path.
 	Fallback purser.Caller
 
-	// Enforce turns a failed authentication into 401 instead of a
-	// downgrade to Fallback. This is the posture for a surface that
-	// requires a credential; leaving it false is the posture for one
-	// that permits anonymous access.
+	// Enforce turns a failed authentication into an error response
+	// instead of a downgrade to Fallback: 401 when the authenticator
+	// rejected the credential, 503 when it could not reach a verdict.
+	// This is the posture for a surface that requires a credential;
+	// leaving it false is the posture for one that permits anonymous
+	// access.
 	//
 	// It is also what CallerMiddleware.GatesCredentials reports, and so
 	// what CheckBind reads when deciding whether this surface is safe
@@ -62,8 +65,10 @@ type CallerOptions struct {
 	// entitled to must be refused rather than ignored.
 	ProxyHeader string
 
-	// Logger receives the rejected-assertion audit line. Nil means
-	// slog.Default().
+	// Logger receives the rejected-assertion audit line, a Warn for
+	// every request whose authenticator could not reach a verdict, and
+	// a Debug for every 401 naming the authenticator's reason. Nil
+	// means slog.Default().
 	Logger *slog.Logger
 
 	// Challenge is the WWW-Authenticate value sent with every 401 this
@@ -120,8 +125,12 @@ var _ Gate = (*CallerMiddleware)(nil)
 //     other error are treated alike, because an authenticator must not
 //     return an identity alongside an error, so there is nothing to
 //     fall back to either way.
-//   - The authenticator returns any error and Enforce is true: 401,
-//     and the handler does not run.
+//   - The authenticator returns purser.ErrUnauthenticated and Enforce
+//     is true: 401 with the configured challenge, and the handler does
+//     not run.
+//   - The authenticator returns any other error and Enforce is true:
+//     503 with Retry-After and no challenge, and the handler does not
+//     run. See "401 or 503" below.
 //   - The request carries the proxy header: 401 unless the request
 //     authenticated, the authenticator implements
 //     authn.AuthenticatorWithProxy, it permits this caller to proxy,
@@ -166,6 +175,26 @@ var _ Gate = (*CallerMiddleware)(nil)
 // A validated proxy assertion outranks both: the asserted path is what
 // an audit record should show, with the proxying credential kept
 // alongside it under purser.WithProxyBy.
+//
+// # 401 or 503
+//
+// purser.ErrUnauthenticated is the only error that is a verdict on the
+// credential, and the only one that earns a 401. Anything else means
+// the authenticator could not decide — its issuer's keys would not
+// load, the endpoint it asks did not answer — and is a 503. The
+// difference is what the client does next: a 401 tells it to discard
+// its credential and sign in again, which during an outage on this side
+// sends every user back through sign-in at once for a credential that
+// was fine. purser.ErrUnavailable is how an authenticator says so on
+// purpose, and it takes precedence when an error matches both; an error
+// matching neither is treated the same way, since it is not a verdict
+// either.
+//
+// The 503 carries no WWW-Authenticate, for the same reason. It is
+// logged at Warn whatever Enforce says: with Enforce off the request
+// still proceeds as Fallback, so a signed-in user is quietly served as
+// anonymous for the length of the outage, and the log line is the only
+// place that shows.
 func NewCaller(opts CallerOptions) (*CallerMiddleware, error) {
 	a := opts.Authenticator
 	if a == nil {
@@ -275,13 +304,23 @@ func (m *CallerMiddleware) Middleware() Middleware {
 // resolve runs the authenticator and settles the Caller and the
 // auth-source verdict. authenticated reports whether a credential was
 // actually verified, as distinct from a Caller having been produced.
-// ok is false when a 401 has already been written and the request must
-// not proceed.
+// ok is false when a response has already been written and the request
+// must not proceed.
 func (m *CallerMiddleware) resolve(w http.ResponseWriter, r *http.Request) (purser.Caller, purser.AuthSource, bool, bool) {
 	c, err := m.authenticator.Authenticate(r)
 	if err != nil {
+		unavailable := isUnavailable(err)
+		if unavailable {
+			m.logUnavailable(r, err)
+		}
 		if m.enforce {
-			m.writeUnauthorized(w, err)
+			if unavailable {
+				writeUnavailable(w)
+			} else {
+				m.log.DebugContext(r.Context(), "purser: authentication rejected",
+					"source", m.authenticator.Source(), "err", err)
+				m.writeUnauthorized(w, err)
+			}
 			return purser.Caller{}, "", false, false
 		}
 		// Cloned per request: the fallback is one value held by this
@@ -296,6 +335,35 @@ func (m *CallerMiddleware) resolve(w http.ResponseWriter, r *http.Request) (purs
 	// credential at all.
 	authenticated := m.authenticator.Source() != purser.AuthSourceAnonymous
 	return c, inherited(r, m.authenticator.Source()), authenticated, true
+}
+
+// isUnavailable reports whether err leaves the credential undecided
+// rather than rejected. See NewCaller, "401 or 503".
+func isUnavailable(err error) bool {
+	return errors.Is(err, purser.ErrUnavailable) || !errors.Is(err, purser.ErrUnauthenticated)
+}
+
+// logUnavailable records an authenticator that could not reach a
+// verdict.
+//
+// A request whose client has already gone is the exception. net/http
+// cancels its context, the authenticator's remote call fails with it,
+// and that is no outage: logging it at Warn would alert on every user
+// who closed a tab mid-request.
+//
+// Canceled only, not any ended context. A deadline the server set
+// itself — http.TimeoutHandler, a context.WithTimeout further out —
+// ends it with DeadlineExceeded, and an authenticator whose dependency
+// is slow enough to trip that is exactly the outage this line reports.
+func (m *CallerMiddleware) logUnavailable(r *http.Request, err error) {
+	ctx := r.Context()
+	if errors.Is(ctx.Err(), context.Canceled) {
+		m.log.DebugContext(ctx, "purser: authenticator could not reach a verdict; the client had already gone",
+			"source", m.authenticator.Source(), "err", err)
+		return
+	}
+	m.log.WarnContext(ctx, "purser: authenticator could not reach a verdict",
+		"source", m.authenticator.Source(), "enforce", m.enforce, "err", err)
 }
 
 // inherited returns source, or the verdict an outer middleware already
@@ -376,7 +444,10 @@ func (m *CallerMiddleware) resolveProxyAssertion(requester purser.Caller, authen
 // distinguishable from the outside by whether the request carried the
 // asserted-caller header. What stays out is anything the authenticator
 // said about *why* a credential failed — that is the operator's, and
-// it is on the log line. The challenge is CallerOptions.Challenge.
+// it is on the log line: Debug for a rejected credential, which every
+// unauthenticated probe on the internet would otherwise turn into a
+// Warn, and Warn for a rejected assertion, which is a security event.
+// The challenge is CallerOptions.Challenge.
 func (m *CallerMiddleware) writeUnauthorized(w http.ResponseWriter, err error) {
 	w.Header().Set("WWW-Authenticate", m.challenge)
 	msg := "unauthorized"
@@ -389,6 +460,24 @@ func (m *CallerMiddleware) writeUnauthorized(w http.ResponseWriter, err error) {
 		msg = "unauthorized: no valid credential"
 	}
 	http.Error(w, msg, http.StatusUnauthorized)
+}
+
+// retryAfter is the Retry-After on a 503, in seconds. It is a hint and
+// deliberately short: an authenticator's dependency coming back is
+// noticed on the next request, so the cost of a client retrying early
+// is one more cheap 503, and the cost of it waiting too long is a user
+// locked out after the outage has ended.
+const retryAfter = "10"
+
+// writeUnavailable writes the 503 for an authenticator that could not
+// reach a verdict.
+//
+// No WWW-Authenticate. A challenge is an invitation to authenticate
+// afresh, which is the reaction this status exists to prevent: the
+// credential the client already holds may be perfectly good.
+func writeUnavailable(w http.ResponseWriter) {
+	w.Header().Set("Retry-After", retryAfter)
+	http.Error(w, "service unavailable: the credential could not be verified; retry", http.StatusServiceUnavailable)
 }
 
 // validFieldValue reports whether v may be sent as an HTTP header value:

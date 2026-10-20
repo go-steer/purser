@@ -225,6 +225,11 @@ func checkNoCredential(r reporter, s Subject) {
 	if !errors.Is(err, purser.ErrUnauthenticated) {
 		r.Errorf("Authenticate(no credential) error = %v, want purser.ErrUnauthenticated", err)
 	}
+	if errors.Is(err, purser.ErrUnavailable) {
+		r.Errorf("Authenticate(no credential) error = %v also matches purser.ErrUnavailable; "+
+			"surfaces give that precedence and answer 503, telling the client to retry a request "+
+			"that carries nothing to verify", err)
+	}
 	if !c.IsZero() {
 		r.Errorf("Authenticate(no credential) returned Caller %q alongside an error; "+
 			"a consumer that ignores the error would act on an unverified identity", c.Identity)
@@ -276,6 +281,11 @@ func checkMalformedCredential(r reporter, s Subject) {
 		if !errors.Is(err, purser.ErrUnauthenticated) {
 			r.Errorf("Authenticate(malformed %q) error = %v, want purser.ErrUnauthenticated so "+
 				"surfaces can map it to 401", mc.Name, err)
+		}
+		if errors.Is(err, purser.ErrUnavailable) {
+			r.Errorf("Authenticate(malformed %q) error = %v also matches purser.ErrUnavailable; "+
+				"a malformed credential is a verdict, and surfaces would answer 503 and invite a retry "+
+				"that can never succeed", mc.Name, err)
 		}
 		if !c.IsZero() {
 			r.Errorf("Authenticate(malformed %q) returned Caller %q alongside an error",

@@ -143,8 +143,17 @@ func TestRefetchFloorBoundsAmplification(t *testing.T) {
 
 	for i := 0; i < 50; i++ {
 		token := iss.Mint(t, authtest.TokenOptions{Email: alice, UnpublishedKey: true})
-		if _, err := authenticate(t, a, token); !errors.Is(err, purser.ErrUnauthenticated) {
+		_, err := authenticate(t, a, token)
+		if !errors.Is(err, purser.ErrUnauthenticated) {
 			t.Fatalf("Authenticate(unpublished key) #%d = %v, want ErrUnauthenticated", i, err)
+		}
+		// The issuer answered, recently, without this key. That is a
+		// verdict, so a 401 — a 503 would invite the sender to retry
+		// a forged token forever, and tell them the issuer was down
+		// when it was not.
+		if errors.Is(err, purser.ErrUnavailable) {
+			t.Fatalf("Authenticate(unpublished key) #%d = %v also matches ErrUnavailable, "+
+				"but the issuer was up", i, err)
 		}
 	}
 	if got := iss.JWKSRequests(); got != 1 {
@@ -245,7 +254,8 @@ func TestCachedKeysSurviveAnIssuerOutage(t *testing.T) {
 }
 
 // TestFirstFetchFailureIsReported covers the cold cache: with nothing
-// to fall back on, the outage is the answer.
+// to fall back on, the outage is the answer — reported as one, not as a
+// bad token.
 func TestFirstFetchFailureIsReported(t *testing.T) {
 	t.Parallel()
 
@@ -254,11 +264,21 @@ func TestFirstFetchFailureIsReported(t *testing.T) {
 	iss.Close()
 
 	_, err := authenticate(t, a, token)
-	if !errors.Is(err, purser.ErrUnauthenticated) {
-		t.Fatalf("Authenticate with an unreachable issuer = %v, want ErrUnauthenticated", err)
-	}
+	wantUnavailable(t, err)
 	if !strings.Contains(err.Error(), "discovering") {
 		t.Errorf("error = %v, want it to name the failed discovery", err)
+	}
+
+	// The next request lands inside the refetch floor, which declines
+	// to try again. It must still read as an outage: the floor is
+	// standing between it and an issuer that did not answer, not
+	// reporting that the key is absent. Otherwise an outage is a 503
+	// for the first request and a 401 for every one after it until the
+	// floor elapses.
+	_, err = authenticate(t, a, token)
+	wantUnavailable(t, err)
+	if !strings.Contains(err.Error(), "failed") || !strings.Contains(err.Error(), "floor") {
+		t.Errorf("error = %v, want it to name the floor and the failed attempt", err)
 	}
 }
 
@@ -378,9 +398,9 @@ func TestUnusableKeysAreExcludedNotJustOutvoted(t *testing.T) {
 				"keys": []any{key},
 			})
 			_, err := authenticate(t, a, iss.Mint(t, authtest.TokenOptions{Email: alice}))
-			if !errors.Is(err, purser.ErrUnauthenticated) {
-				t.Fatalf("Authenticate = %v, want ErrUnauthenticated", err)
-			}
+			// Unavailable, not unauthenticated: an issuer publishing
+			// nothing usable cannot judge any token, good or bad.
+			wantUnavailable(t, err)
 			if !strings.Contains(err.Error(), "no usable public signing key") {
 				t.Errorf("error = %v, want the key to have been excluded from the set entirely", err)
 			}
@@ -480,9 +500,7 @@ func TestRedirectToPlaintextIsRefused(t *testing.T) {
 		if err == nil {
 			t.Fatalf("Authenticate succeeded as %q: the key set was read over cleartext", c.Identity)
 		}
-		if !errors.Is(err, purser.ErrUnauthenticated) {
-			t.Errorf("error = %v, want purser.ErrUnauthenticated", err)
-		}
+		wantUnavailable(t, err)
 		if !strings.Contains(err.Error(), "refusing a redirect to http://") {
 			t.Errorf("error = %v, want the redirect policy to be what refused it", err)
 		}
@@ -759,9 +777,7 @@ func TestBadKeyEndpoints(t *testing.T) {
 				t.Fatalf("Authenticate succeeded as %q against a key endpoint that must not be "+
 					"believed", c.Identity)
 			}
-			if !errors.Is(err, purser.ErrUnauthenticated) {
-				t.Errorf("error = %v, want purser.ErrUnauthenticated", err)
-			}
+			wantUnavailable(t, err)
 			if !strings.Contains(err.Error(), tt.wantErr) {
 				t.Errorf("error = %v, want it to mention %q", err, tt.wantErr)
 			}

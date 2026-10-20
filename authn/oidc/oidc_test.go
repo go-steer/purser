@@ -70,6 +70,23 @@ func authenticate(t *testing.T, a *oidc.Auth, token string) (purser.Caller, erro
 	return a.Authenticate(request(token))
 }
 
+// wantUnavailable fails unless err is purser.ErrUnavailable and not
+// also purser.ErrUnauthenticated: a refusal, but not a verdict on the
+// token. go-steer/purser#23 — a 401 here sends the client back through
+// sign-in for a token that may be fine.
+func wantUnavailable(t *testing.T, err error) {
+	t.Helper()
+	if err == nil {
+		t.Fatal("Authenticate succeeded, want purser.ErrUnavailable")
+	}
+	if !errors.Is(err, purser.ErrUnavailable) {
+		t.Errorf("error = %v, want purser.ErrUnavailable", err)
+	}
+	if errors.Is(err, purser.ErrUnauthenticated) {
+		t.Errorf("error = %v also matches purser.ErrUnauthenticated: the token was never judged", err)
+	}
+}
+
 func TestConformance(t *testing.T) {
 	t.Parallel()
 

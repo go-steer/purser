@@ -12,7 +12,47 @@ in [`CONTRIBUTING.md`](./CONTRIBUTING.md).
 
 ## [Unreleased]
 
-*Nothing yet.*
+### Added
+- `purser.ErrUnavailable`: the sentinel for an authenticator that could not
+  reach a verdict at all — the issuer's keys would not load, the endpoint it
+  asks did not answer, the directory it resolves groups against was
+  unreachable. HTTP surfaces map it to 503. Return it only when the failure
+  says nothing about the credential; a missing, malformed, expired or forged
+  credential stays `ErrUnauthenticated`.
+  ([#23](https://github.com/go-steer/purser/issues/23))
+
+### Changed
+- **`httpmw.CallerMiddleware` answers 503, not 401, when the authenticator
+  could not decide.** Under `Enforce`, only `ErrUnauthenticated` is a 401. An
+  error wrapping `ErrUnavailable`, or wrapping neither sentinel, is now a 503
+  with `Retry-After` and no `WWW-Authenticate`; `ErrUnavailable` wins when an
+  error matches both. A 401 tells a client to discard its credential and sign
+  in again — an MCP client re-runs OAuth — which during an outage on the
+  server's side sent every user back through sign-in for a credential that was
+  fine. Without `Enforce` the request still falls back as before.
+  ([#23](https://github.com/go-steer/purser/issues/23))
+
+  **Check before upgrading:** an authenticator that reports a *bad credential*
+  with a bare error, not wrapping `ErrUnauthenticated`, now draws a 503 and an
+  invitation to retry instead of a 401. The conformance suite has always
+  required `ErrUnauthenticated` for missing and malformed credentials, so
+  authenticators that pass it are unaffected — but nothing enforced that on
+  any other kind of bad credential.
+- `httpmw.CallerMiddleware` now logs authentication failures, through
+  `CallerOptions.Logger`: an authenticator that could not reach a verdict at
+  Warn (with or without `Enforce`, naming its `Source()` and the error), and a
+  rejected credential at Debug. The `writeUnauthorized` doc comment said the
+  authenticator's reason was "on the log line"; until now it was not.
+- `authn/oidc` returns `ErrUnavailable`, not `ErrUnauthenticated`, when it
+  cannot obtain the issuer's keys and nothing cached matches: discovery or the
+  key fetch failed, the discovery document was refused, a redirect left
+  https, or the key set held nothing usable. Inside `KeyRefreshFloor` after a
+  *failed* fetch is still unavailable; inside it after a successful one, with
+  the token's key ID absent, is still `ErrUnauthenticated`, so an unknown key
+  ID sprayed at a healthy issuer is a 401 as before.
+- `authtest.RunAuthenticatorSuite` rejects an authenticator that wraps
+  `ErrUnavailable` on a missing or malformed credential. Such an authenticator
+  passed every other check and would still have drawn a 503.
 
 ## [0.2.0] - 2026-10-14
 
