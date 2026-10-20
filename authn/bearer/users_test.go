@@ -15,6 +15,7 @@
 package bearer_test
 
 import (
+	"context"
 	"errors"
 	"io/fs"
 	"os"
@@ -276,7 +277,7 @@ func TestNewFromFileIgnoresOptionsUsers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewFromFile() = %v, want success", err)
 	}
-	if _, ok := a.LookupIdentity("mallory@example.com"); ok {
+	if _, err := a.LookupIdentity(context.Background(), "mallory@example.com"); err == nil {
 		t.Error("NewFromFile merged Options.Users into the table, want the file's rows only")
 	}
 }

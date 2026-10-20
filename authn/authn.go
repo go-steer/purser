@@ -26,6 +26,7 @@
 package authn
 
 import (
+	"context"
 	"net/http"
 
 	"github.com/go-steer/purser"
@@ -97,10 +98,27 @@ type AuthenticatorWithProxy interface {
 // Claim-based authenticators (OIDC) have no such table and do not
 // implement it; for them an asserted identity can only be taken at
 // face value, which is why the proxy allowlist is the real control.
+//
+// The table need not be in memory. A lookup backed by a directory or a
+// user service can fail without saying anything about the identity,
+// which is why the result is an error rather than a found bit, and why
+// it takes the request's context.
 type IdentityLookup interface {
 	// LookupIdentity returns the Caller provisioned under identity.
-	// ok is false when the identity is not provisioned, and must be
-	// false for the empty string.
+	//
+	//   - Provisioned: the Caller and a nil error. A zero Caller with a
+	//     nil error is a bug.
+	//   - Not provisioned, including the empty string: an error
+	//     wrapping purser.ErrAssertedCallerUnknown. This is a verdict,
+	//     and httpmw answers it 401.
+	//   - Could not tell — the store behind it did not answer: an error
+	//     wrapping purser.ErrUnavailable, never ErrAssertedCallerUnknown
+	//     as well. httpmw answers it 503, so the asserting proxy retries
+	//     rather than concluding the identity does not exist
+	//     (go-steer/purser#28).
+	//
+	// ctx is the request's. A remote lookup should honor it, so a
+	// client that hangs up does not leave a directory query running.
 	//
 	// As with Authenticate, the returned Caller's Labels must not
 	// alias state the authenticator retains — return
@@ -108,7 +126,7 @@ type IdentityLookup interface {
 	// handler that adds a label to what it believes is its own copy
 	// would otherwise rewrite the provisioned identity for every later
 	// request.
-	LookupIdentity(identity string) (purser.Caller, bool)
+	LookupIdentity(ctx context.Context, identity string) (purser.Caller, error)
 }
 
 // CredentialGate is the optional extension by which an authenticator

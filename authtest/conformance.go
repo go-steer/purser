@@ -15,6 +15,7 @@
 package authtest
 
 import (
+	"context"
 	"errors"
 	"maps"
 	"net/http"
@@ -338,14 +339,14 @@ func checkLookupLabelsNotAliased(r reporter, s Subject) {
 	if !ok || s.ProvisionedIdentity == "" {
 		return
 	}
-	first, found := l.LookupIdentity(s.ProvisionedIdentity)
-	if !found {
-		r.Errorf("LookupIdentity(%q) = not-found, but Subject.ProvisionedIdentity names an "+
-			"identity the table is expected to contain", s.ProvisionedIdentity)
+	first, err := l.LookupIdentity(context.Background(), s.ProvisionedIdentity)
+	if err != nil {
+		r.Errorf("LookupIdentity(%q) = %v, but Subject.ProvisionedIdentity names an "+
+			"identity the table is expected to contain", s.ProvisionedIdentity, err)
 		return
 	}
 	if first.IsZero() {
-		r.Errorf("LookupIdentity(%q) returned a zero Caller with found=true", s.ProvisionedIdentity)
+		r.Errorf("LookupIdentity(%q) returned a zero Caller with a nil error", s.ProvisionedIdentity)
 		return
 	}
 	if len(first.Labels) == 0 {
@@ -353,8 +354,8 @@ func checkLookupLabelsNotAliased(r reporter, s Subject) {
 	}
 	first.Labels[canaryLabel] = "written by the conformance suite"
 
-	second, found := l.LookupIdentity(s.ProvisionedIdentity)
-	if !found {
+	second, err := l.LookupIdentity(context.Background(), s.ProvisionedIdentity)
+	if err != nil {
 		return
 	}
 	if _, leaked := second.Labels[canaryLabel]; leaked {
@@ -394,27 +395,37 @@ func checkProxyDefaultDeny(r reporter, s Subject) {
 }
 
 // checkUnknownAssertedIdentity pins that an identity table reports
-// absence rather than inventing a Caller.
+// absence rather than inventing a Caller — and reports it as the
+// verdict it is. Absence is purser.ErrAssertedCallerUnknown, a 401; an
+// implementation that also wraps purser.ErrUnavailable would draw a 503
+// and tell the asserting proxy to retry an identity that will never
+// exist.
 func checkUnknownAssertedIdentity(r reporter, s Subject) {
 	r.Helper()
 	l, ok := s.Authenticator.(authn.IdentityLookup)
 	if !ok {
 		return
 	}
-	if c, found := l.LookupIdentity(""); found {
-		r.Errorf("LookupIdentity(\"\") resolved to %q, want not-found", c.Identity)
+	ids := []string{"", unprovisioned}
+	if s.UnprovisionedIdentity != "" {
+		ids = append(ids, s.UnprovisionedIdentity)
 	}
-	for _, id := range []string{unprovisioned, s.UnprovisionedIdentity} {
-		if id == "" {
+	for _, id := range ids {
+		c, err := l.LookupIdentity(context.Background(), id)
+		if err == nil {
+			r.Errorf("LookupIdentity(%q) resolved to %q, want purser.ErrAssertedCallerUnknown", id, c.Identity)
 			continue
 		}
-		c, found := l.LookupIdentity(id)
-		if found {
-			r.Errorf("LookupIdentity(%q) resolved to %q, want not-found", id, c.Identity)
-			continue
+		if !errors.Is(err, purser.ErrAssertedCallerUnknown) {
+			r.Errorf("LookupIdentity(%q) error = %v, want purser.ErrAssertedCallerUnknown so "+
+				"surfaces can map it to 401", id, err)
+		}
+		if errors.Is(err, purser.ErrUnavailable) {
+			r.Errorf("LookupIdentity(%q) error = %v also matches purser.ErrUnavailable; an identity "+
+				"nobody provisioned is a verdict, and surfaces would answer 503", id, err)
 		}
 		if !c.IsZero() {
-			r.Errorf("LookupIdentity(%q) returned Caller %q with found=false", id, c.Identity)
+			r.Errorf("LookupIdentity(%q) returned Caller %q alongside an error", id, c.Identity)
 		}
 	}
 }

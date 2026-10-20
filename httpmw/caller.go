@@ -40,18 +40,19 @@ type CallerOptions struct {
 	Authenticator authn.Authenticator
 
 	// Fallback is the Caller a request falls back to when the
-	// authenticator returns any error and Enforce is false. A zero
-	// Fallback means purser.Anonymous().
+	// authenticator returns purser.ErrUnauthenticated and Enforce is
+	// false. A zero Fallback means purser.Anonymous(). A credential the
+	// authenticator could not check is a 503 instead, Enforce or not; see
+	// NewCaller, "401 or 503".
 	//
 	// It is refused alongside Enforce, which has no fallback path.
 	Fallback purser.Caller
 
-	// Enforce turns a failed authentication into an error response
-	// instead of a downgrade to Fallback: 401 when the authenticator
-	// rejected the credential, 503 when it could not reach a verdict.
-	// This is the posture for a surface that requires a credential;
-	// leaving it false is the posture for one that permits anonymous
-	// access.
+	// Enforce turns a rejected credential into a 401 instead of a
+	// downgrade to Fallback. This is the posture for a surface that
+	// requires a credential; leaving it false is the posture for one
+	// that permits anonymous access. It has no bearing on a credential
+	// the authenticator could not check, which is a 503 either way.
 	//
 	// It is also what CallerMiddleware.GatesCredentials reports, and so
 	// what CheckBind reads when deciding whether this surface is safe
@@ -123,18 +124,15 @@ var _ Gate = (*CallerMiddleware)(nil)
 //
 //   - The authenticator succeeds: its Caller goes on the context and
 //     its Source() is the verdict.
-//   - The authenticator returns an error and Enforce is false: Fallback
-//     goes on the context. The verdict is anonymous unless an outer
-//     middleware already stamped a non-anonymous one, in which case
-//     that stands — see below. purser.ErrUnauthenticated and every
-//     other error are treated alike, because an authenticator must not
-//     return an identity alongside an error, so there is nothing to
-//     fall back to either way.
+//   - The authenticator returns purser.ErrUnauthenticated and Enforce
+//     is false: Fallback goes on the context. The verdict is anonymous
+//     unless an outer middleware already stamped a non-anonymous one, in
+//     which case that stands — see below.
 //   - The authenticator returns purser.ErrUnauthenticated and Enforce
 //     is true: 401 with the configured challenge, and the handler does
 //     not run.
-//   - The authenticator returns any other error and Enforce is true:
-//     503 with Retry-After and no challenge, and the handler does not
+//   - The authenticator returns any other error: 503 with Retry-After
+//     and no challenge, whatever Enforce says, and the handler does not
 //     run. See "401 or 503" below.
 //   - The request carries the proxy header: 401 unless the request
 //     authenticated, the authenticator implements
@@ -195,11 +193,25 @@ var _ Gate = (*CallerMiddleware)(nil)
 // matching neither is treated the same way, since it is not a verdict
 // either.
 //
-// The 503 carries no WWW-Authenticate, for the same reason. It is
-// logged at Warn whatever Enforce says: with Enforce off the request
-// still proceeds as Fallback, so a signed-in user is quietly served as
-// anonymous for the length of the outage, and the log line is the only
-// place that shows.
+// The 503 carries no WWW-Authenticate, for the same reason, and is
+// logged at Warn.
+//
+// It applies with Enforce off too (go-steer/purser#29). The fallback is
+// for a request that brought no credential worth honoring, and an
+// undecided one is not that: the authn.Authenticator contract makes a
+// missing credential ErrUnauthenticated, and the conformance suite
+// forbids ErrUnavailable alongside it, so only a client that presented
+// a credential gets here. It asked to be someone. Serving it as
+// Fallback would attribute its request to nobody and show it a view
+// with its own state missing — signed out, its sessions gone — with
+// nothing to say that retrying would fix it. Anonymous traffic is
+// untouched: no credential is still ErrUnauthenticated, and still falls
+// back.
+//
+// The same split holds on the proxy path. An asserted identity the
+// authenticator's authn.IdentityLookup could not resolve — the
+// directory behind it did not answer — is a 503, not the 401 for an
+// identity nobody provisioned.
 func NewCaller(opts CallerOptions) (*CallerMiddleware, error) {
 	a := opts.Authenticator
 	if a == nil {
@@ -281,15 +293,24 @@ func (m *CallerMiddleware) Middleware() Middleware {
 			// trimmed: a header that is present but blank asserts
 			// nothing, and must not read as "no assertion was made".
 			if raw := r.Header.Get(m.proxyHeader); raw != "" {
-				effective, by, err := m.resolveProxyAssertion(c, authenticated, strings.TrimSpace(raw))
+				effective, by, err := m.resolveProxyAssertion(r.Context(), c, authenticated, strings.TrimSpace(raw))
 				if err != nil {
 					// Logged with the *requesting* identity so an
 					// operator can correlate the attempt with a
 					// credential; the asserted value is attacker-
 					// controlled and goes in as a quoted attribute.
+					// The error may come from a third-party
+					// IdentityLookup, so it is scrubbed like an
+					// authenticator's.
+					if assertionUndecided(err) {
+						m.logUnavailable(r, "purser: proxy assertion could not be resolved", err,
+							"requester", c.Identity, "asserted", raw)
+						writeUnavailable(w)
+						return
+					}
 					m.log.WarnContext(r.Context(), "purser: proxy assertion rejected",
 						"requester", c.Identity, "authenticated", authenticated,
-						"asserted", raw, "err", err)
+						"asserted", raw, "err", scrubbed(r, err))
 					m.writeUnauthorized(w, err)
 					return
 				}
@@ -314,18 +335,17 @@ func (m *CallerMiddleware) Middleware() Middleware {
 func (m *CallerMiddleware) resolve(w http.ResponseWriter, r *http.Request) (purser.Caller, purser.AuthSource, bool, bool) {
 	c, err := m.authenticator.Authenticate(r)
 	if err != nil {
-		unavailable := isUnavailable(err)
-		if unavailable {
-			m.logUnavailable(r, err)
+		if isUnavailable(err) {
+			// Enforce or not: only a request that presented a
+			// credential gets here. See NewCaller, "401 or 503".
+			m.logUnavailable(r, "purser: authenticator could not reach a verdict", err)
+			writeUnavailable(w)
+			return purser.Caller{}, "", false, false
 		}
 		if m.enforce {
-			if unavailable {
-				writeUnavailable(w)
-			} else {
-				m.log.DebugContext(r.Context(), "purser: authentication rejected",
-					"source", m.authenticator.Source(), "err", scrubbed(r, err))
-				m.writeUnauthorized(w, err)
-			}
+			m.log.DebugContext(r.Context(), "purser: authentication rejected",
+				"source", m.authenticator.Source(), "err", scrubbed(r, err))
+			m.writeUnauthorized(w, err)
 			return purser.Caller{}, "", false, false
 		}
 		// Cloned per request: the fallback is one value held by this
@@ -348,27 +368,41 @@ func isUnavailable(err error) bool {
 	return errors.Is(err, purser.ErrUnavailable) || !errors.Is(err, purser.ErrUnauthenticated)
 }
 
-// logUnavailable records an authenticator that could not reach a
-// verdict.
+// assertionUndecided is isUnavailable for the proxy path, where the
+// verdicts are purser.ErrAssertedCallerForbidden and
+// purser.ErrAssertedCallerUnknown. Anything else came from an
+// authn.IdentityLookup that could not resolve the identity (#28), and
+// is a 503: telling the asserting proxy the identity does not exist,
+// when the directory behind the lookup merely did not answer, is the
+// same misreport #23 fixed for Authenticate.
+func assertionUndecided(err error) bool {
+	if errors.Is(err, purser.ErrUnavailable) {
+		return true
+	}
+	return !errors.Is(err, purser.ErrAssertedCallerForbidden) && !errors.Is(err, purser.ErrAssertedCallerUnknown)
+}
+
+// logUnavailable records a 503: something this middleware asked could
+// not reach a verdict. attrs are added to the line after the source.
 //
 // A request whose client has already gone is the exception. net/http
-// cancels its context, the authenticator's remote call fails with it,
-// and that is no outage: logging it at Warn would alert on every user
-// who closed a tab mid-request.
+// cancels its context, the remote call fails with it, and that is no
+// outage: logging it at Warn would alert on every user who closed a
+// tab mid-request.
 //
 // Canceled only, not any ended context. A deadline the server set
 // itself — http.TimeoutHandler, a context.WithTimeout further out —
-// ends it with DeadlineExceeded, and an authenticator whose dependency
-// is slow enough to trip that is exactly the outage this line reports.
-func (m *CallerMiddleware) logUnavailable(r *http.Request, err error) {
+// ends it with DeadlineExceeded, and a dependency slow enough to trip
+// that is exactly the outage this line reports.
+func (m *CallerMiddleware) logUnavailable(r *http.Request, msg string, err error, attrs ...any) {
 	ctx := r.Context()
+	args := append([]any{"source", m.authenticator.Source()}, attrs...)
+	args = append(args, "err", scrubbed(r, err))
 	if errors.Is(ctx.Err(), context.Canceled) {
-		m.log.DebugContext(ctx, "purser: authenticator could not reach a verdict; the client had already gone",
-			"source", m.authenticator.Source(), "err", scrubbed(r, err))
+		m.log.DebugContext(ctx, msg+"; the client had already gone", args...)
 		return
 	}
-	m.log.WarnContext(ctx, "purser: authenticator could not reach a verdict",
-		"source", m.authenticator.Source(), "enforce", m.enforce, "err", scrubbed(r, err))
+	m.log.WarnContext(ctx, msg, args...)
 }
 
 // redacted stands in for credential material removed from a log line.
@@ -464,8 +498,10 @@ func inherited(r *http.Request, source purser.AuthSource) purser.AuthSource {
 // purser.ErrAssertedCallerForbidden when the request did not
 // authenticate, the authenticator cannot proxy at all, or this caller
 // is not permitted to; purser.ErrAssertedCallerUnknown when the
-// asserted identity is blank or not provisioned.
-func (m *CallerMiddleware) resolveProxyAssertion(requester purser.Caller, authenticated bool, asserted string) (purser.Caller, string, error) {
+// asserted identity is blank or not provisioned. A lookup that could
+// not tell returns its own error, which the caller answers 503 — see
+// assertionUndecided.
+func (m *CallerMiddleware) resolveProxyAssertion(ctx context.Context, requester purser.Caller, authenticated bool, asserted string) (purser.Caller, string, error) {
 	if !authenticated {
 		// The requester is the fallback, not a verified caller. No
 		// allowlist can make an unauthenticated request entitled to
@@ -501,9 +537,17 @@ func (m *CallerMiddleware) resolveProxyAssertion(requester purser.Caller, authen
 	// name; for those the proxy allowlist is the whole control, which
 	// authn.IdentityLookup documents.
 	if lookup, ok := m.authenticator.(authn.IdentityLookup); ok {
-		c, found := lookup.LookupIdentity(asserted)
-		if !found {
-			return purser.Caller{}, "", purser.ErrAssertedCallerUnknown
+		c, err := lookup.LookupIdentity(ctx, asserted)
+		if err != nil {
+			return purser.Caller{}, "", err
+		}
+		if c.IsZero() {
+			// A contract violation — found, but nobody. Refused as
+			// unprovisioned rather than handed on, since a zero Caller
+			// with no error is the shape every consumer reads as
+			// proof of identity.
+			return purser.Caller{}, "", fmt.Errorf("httpmw: %T.LookupIdentity(%q) returned a zero Caller with a nil error: %w",
+				lookup, asserted, purser.ErrAssertedCallerUnknown)
 		}
 		// Cloned even though the contract asks implementations to do
 		// it themselves: this middleware hands the result straight to

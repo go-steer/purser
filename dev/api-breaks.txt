@@ -17,4 +17,13 @@
 # sit behind the new baseline, and a leftover entry would silently permit
 # a second, unrelated removal of a symbol that no longer exists.
 #
-# (empty — nothing has been broken since v0.3.1)
+# #28: LookupIdentity returned a found bit and took no context, so a
+# lookup backed by a directory could neither report "could not tell" nor
+# honor the request's cancellation; a proxy assertion during an outage
+# drew 401 ErrAssertedCallerUnknown. It now returns an error
+# (ErrAssertedCallerUnknown / ErrUnavailable) and takes the request's
+# context. Nothing outside purser implements or calls it today —
+# core-agent and mast carry their own pre-migration copies — so the
+# break costs no consumer anything, and only gets dearer after phase 2.
+./authn.IdentityLookup.LookupIdentity: changed from func(string) (github.com/go-steer/purser.Caller, bool) to func(context.Context, string) (github.com/go-steer/purser.Caller, error)
+./authn/bearer.(*Auth).LookupIdentity: changed from func(string) (github.com/go-steer/purser.Caller, bool) to func(context.Context, string) (github.com/go-steer/purser.Caller, error)

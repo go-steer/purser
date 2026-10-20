@@ -295,35 +295,60 @@ func TestCallerRejectionDoesNotLeakTheReason(t *testing.T) {
 // An authenticator that returns something other than
 // ErrUnauthenticated — a JWKS fetch that failed, a torn credential
 // file — must not be treated as a successful authentication. It has no
-// identity to offer either way. Enforced, it is a 503 rather than a
-// 401; see TestCallerUndecidedIs503.
+// identity to offer either way. It is a 503, and the handler does not
+// run, whether or not Enforce is set; see TestCallerUndecidedIs503.
 func TestCallerNonSentinelErrorIsStillAFailure(t *testing.T) {
 	t.Parallel()
 	boom := errors.New("purser: issuer keys unavailable")
 
+	for _, enforce := range []bool{false, true} {
+		got, rec := serve(t, mustCaller(t, CallerOptions{
+			Authenticator: fakeAuth{err: boom, source: purser.AuthSourceOIDC},
+			Enforce:       enforce,
+		}), get())
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Errorf("enforce=%v: status = %d, want 503", enforce, rec.Code)
+		}
+		if got.ran {
+			t.Errorf("enforce=%v: the handler ran on a request whose authenticator failed", enforce)
+		}
+	}
+}
+
+// TestCallerUndecidedIs503WithoutEnforce is go-steer/purser#29. Only a
+// request that presented a credential can draw ErrUnavailable — no
+// credential is ErrUnauthenticated, by contract — so falling back would
+// serve someone who asked to be themselves as the fallback: their
+// request attributed to nobody, their own state missing, and nothing in
+// a 200 telling them to retry. Anonymous traffic is unaffected.
+func TestCallerUndecidedIs503WithoutEnforce(t *testing.T) {
+	t.Parallel()
 	got, rec := serve(t, mustCaller(t, CallerOptions{
-		Authenticator: fakeAuth{err: boom, source: purser.AuthSourceOIDC},
+		Authenticator: fakeAuth{err: fmt.Errorf("issuer down: %w", purser.ErrUnavailable), source: purser.AuthSourceOIDC},
 		Fallback:      purser.Caller{Identity: "anon"},
 	}), get())
-	if rec.Code != http.StatusOK {
-		t.Fatalf("non-enforcing status = %d, want 200", rec.Code)
-	}
-	if got.caller.Identity != "anon" {
-		t.Errorf("identity = %q, want the fallback", got.caller.Identity)
-	}
-	if got.source != purser.AuthSourceAnonymous {
-		t.Errorf("auth source = %q, want anonymous: the authenticator failed", got.source)
-	}
 
-	got, rec = serve(t, mustCaller(t, CallerOptions{
-		Authenticator: fakeAuth{err: boom, source: purser.AuthSourceOIDC},
-		Enforce:       true,
-	}), get())
 	if rec.Code != http.StatusServiceUnavailable {
-		t.Errorf("enforcing status = %d, want 503", rec.Code)
+		t.Fatalf("status = %d, want 503", rec.Code)
 	}
 	if got.ran {
-		t.Error("the handler ran on a request whose authenticator failed")
+		t.Errorf("the handler ran as %q; an undecided credential must not be served as the fallback", got.caller.Identity)
+	}
+	if rec.Header().Get("Retry-After") == "" {
+		t.Error("no Retry-After on the 503")
+	}
+	if c := rec.Header().Get("WWW-Authenticate"); c != "" {
+		t.Errorf("WWW-Authenticate = %q on a 503, want none", c)
+	}
+
+	// The other half: no credential is still ErrUnauthenticated, and on
+	// a surface that permits anonymous access it still falls back.
+	got, rec = serve(t, mustCaller(t, CallerOptions{
+		Authenticator: fakeAuth{err: fmt.Errorf("no token presented: %w", purser.ErrUnauthenticated), source: purser.AuthSourceOIDC},
+		Fallback:      purser.Caller{Identity: "anon"},
+	}), get())
+	if rec.Code != http.StatusOK || got.caller.Identity != "anon" {
+		t.Errorf("no credential, Enforce off: status = %d, identity = %q; want 200 as the fallback", rec.Code, got.caller.Identity)
 	}
 }
 
@@ -1168,6 +1193,98 @@ func TestCallerProxyWithoutAnIdentityTable(t *testing.T) {
 	}
 }
 
+// TestCallerProxyLookupUndecidedIs503 is go-steer/purser#28. A lookup
+// whose directory did not answer has not established that the asserted
+// identity does not exist, and telling the asserting proxy 401
+// ErrAssertedCallerUnknown — "nobody by that name" — is the misreport
+// #23 fixed for Authenticate, one level down.
+func TestCallerProxyLookupUndecidedIs503(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		err  error
+		want int
+	}{
+		{"not provisioned", fmt.Errorf("no such user: %w", purser.ErrAssertedCallerUnknown), http.StatusUnauthorized},
+		{"ErrUnavailable", fmt.Errorf("directory: connection refused: %w", purser.ErrUnavailable), http.StatusServiceUnavailable},
+		{"neither", errors.New("directory: connection refused"), http.StatusServiceUnavailable},
+		{"both", errors.Join(purser.ErrAssertedCallerUnknown, purser.ErrUnavailable), http.StatusServiceUnavailable},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var logs bytes.Buffer
+			mw := mustCaller(t, CallerOptions{
+				Authenticator: &leakyLookup{err: tc.err},
+				Logger:        slog.New(slog.NewTextHandler(&logs, nil)),
+			})
+			r := get()
+			r.Header.Set(authn.HeaderAssertedCaller, "carol@example.com")
+			got, rec := serve(t, mw, r)
+
+			if rec.Code != tc.want {
+				t.Fatalf("status = %d, want %d (body %q)", rec.Code, tc.want, rec.Body)
+			}
+			if got.ran {
+				t.Error("the handler ran on an assertion that did not resolve")
+			}
+			if tc.want == http.StatusUnauthorized {
+				return
+			}
+			if c := rec.Header().Get("WWW-Authenticate"); c != "" {
+				t.Errorf("WWW-Authenticate = %q on a 503, want none", c)
+			}
+			if rec.Header().Get("Retry-After") == "" {
+				t.Error("no Retry-After on the 503")
+			}
+			out := logs.String()
+			for _, want := range []string{"level=WARN", "sa:gateway", "carol@example.com", "could not be resolved"} {
+				if !strings.Contains(out, want) {
+					t.Errorf("log = %q, want it to contain %q", out, want)
+				}
+			}
+		})
+	}
+}
+
+// The lookup gets the request's context, so a remote one can honor the
+// client hanging up — the reason #28 added the parameter.
+func TestCallerProxyLookupGetsTheRequestContext(t *testing.T) {
+	t.Parallel()
+	type key struct{}
+	var saw any
+	mw := mustCaller(t, CallerOptions{
+		Authenticator: ctxLookup{fn: func(ctx context.Context) { saw = ctx.Value(key{}) }},
+	})
+	r := get()
+	r.Header.Set(authn.HeaderAssertedCaller, "carol@example.com")
+	serve(t, mw, r.WithContext(context.WithValue(r.Context(), key{}, "the request's")))
+
+	if saw != "the request's" {
+		t.Errorf("LookupIdentity saw context value %v, want the request's context", saw)
+	}
+}
+
+// A lookup that reports success with a zero Caller breaks its contract,
+// and the zero Caller is the one shape every consumer reads as proof of
+// identity. Refused as unprovisioned rather than handed on.
+func TestCallerProxyLookupZeroCallerIsRefused(t *testing.T) {
+	t.Parallel()
+	mw := mustCaller(t, CallerOptions{
+		Authenticator: &leakyLookup{table: map[string]purser.Caller{"carol@example.com": {}}},
+	})
+	r := get()
+	r.Header.Set(authn.HeaderAssertedCaller, "carol@example.com")
+	got, rec := serve(t, mw, r)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", rec.Code)
+	}
+	if got.ran {
+		t.Errorf("the handler ran as %q on a lookup that returned nobody", got.caller.Identity)
+	}
+}
+
 // ---------------------------------------------------------------
 // Construction
 // ---------------------------------------------------------------
@@ -1313,6 +1430,20 @@ func (f fakeAuth) Authenticate(*http.Request) (purser.Caller, error) {
 
 func (f fakeAuth) Source() purser.AuthSource { return f.source }
 
+// ctxLookup hands the context LookupIdentity received to fn, and
+// resolves every identity.
+type ctxLookup struct{ fn func(context.Context) }
+
+func (ctxLookup) Authenticate(*http.Request) (purser.Caller, error) {
+	return purser.Caller{Identity: "sa:gateway"}, nil
+}
+func (ctxLookup) Source() purser.AuthSource     { return purser.AuthSourceOIDC }
+func (ctxLookup) CanProxyAs(purser.Caller) bool { return true }
+func (l ctxLookup) LookupIdentity(ctx context.Context, id string) (purser.Caller, error) {
+	l.fn(ctx)
+	return purser.Caller{Identity: id}, nil
+}
+
 // proxyAuthNoTable permits every caller to proxy and has no identity
 // table, the shape a claim-based authenticator has. CanProxyAs is
 // exactly the documented minimum, which is the point: the middleware,
@@ -1330,16 +1461,28 @@ func (alwaysProxy) CanProxyAs(purser.Caller) bool { return true }
 // leakyLookup returns its table entries without cloning — the reading
 // of authn.IdentityLookup that the contract now rules out and that the
 // middleware defends against anyway.
-type leakyLookup struct{ table map[string]purser.Caller }
+//
+// err, when set, is what every lookup returns instead: the store behind
+// it failing, for the #28 cases.
+type leakyLookup struct {
+	table map[string]purser.Caller
+	err   error
+}
 
 func (l *leakyLookup) Authenticate(*http.Request) (purser.Caller, error) {
 	return purser.Caller{Identity: "sa:gateway"}, nil
 }
 func (l *leakyLookup) Source() purser.AuthSource     { return purser.AuthSourceOIDC }
 func (l *leakyLookup) CanProxyAs(purser.Caller) bool { return true }
-func (l *leakyLookup) LookupIdentity(id string) (purser.Caller, bool) {
+func (l *leakyLookup) LookupIdentity(_ context.Context, id string) (purser.Caller, error) {
+	if l.err != nil {
+		return purser.Caller{}, l.err
+	}
 	c, ok := l.table[id]
-	return c, ok
+	if !ok {
+		return purser.Caller{}, purser.ErrAssertedCallerUnknown
+	}
+	return c, nil
 }
 
 var (
