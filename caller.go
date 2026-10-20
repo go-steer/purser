@@ -104,6 +104,28 @@ func Anonymous() Caller {
 // client, which must retry with a good credential either way.
 var ErrUnauthenticated = errors.New("purser: unauthenticated")
 
+// ErrUnavailable is returned by an Authenticator that could not reach a
+// verdict on the credential at all: something it depends on — an
+// issuer's key set, a token-introspection endpoint, a directory it
+// resolves group membership against — did not answer, or answered with
+// something it could not use. HTTP surfaces map it to 503.
+//
+// The distinction from ErrUnauthenticated is what a client should do
+// next. A 401 tells it the credential is bad, and a well-behaved client
+// discards it and signs in again — an MCP client re-runs OAuth. That is
+// the wrong reaction to an outage on the server's side: the credential
+// may be perfectly good, and sending every user back through sign-in
+// at once is a second outage stacked on the first. A 503 tells it to
+// retry the same request.
+//
+// Return it only when the failure says nothing about the credential.
+// Anything the request itself can cause — a missing, malformed,
+// expired or forged credential — is ErrUnauthenticated, and must not
+// wrap this as well: surfaces give ErrUnavailable precedence when an
+// error matches both, so wrapping it on a bad credential turns a 401
+// into an endless retry.
+var ErrUnavailable = errors.New("purser: authentication unavailable")
+
 // ErrAssertedCallerForbidden is returned when a Caller that is not
 // permitted to proxy attempts to assert another identity. Surfaces map
 // it to 401 and should log the attempt: it indicates either

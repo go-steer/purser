@@ -24,6 +24,8 @@ import (
 	"time"
 
 	jose "github.com/go-jose/go-jose/v4"
+
+	"github.com/go-steer/purser"
 )
 
 // fetchTimeout bounds one attempt at the discovery document or the key
@@ -58,6 +60,7 @@ type keySet struct {
 	keys        []jose.JSONWebKey
 	fetchedAt   time.Time // last successful fetch
 	lastAttempt time.Time // last attempt, successful or not: the floor
+	lastFailed  bool      // whether that attempt failed
 	inflight    *inflight
 }
 
@@ -192,14 +195,28 @@ func (k *keySet) refreshKeys(ctx context.Context, since time.Time) (keys []jose.
 		k.mu.Unlock()
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return nil, fmt.Errorf("waiting for the key set from %s: %w: %w", k.issuer, ctx.Err(), purser.ErrUnavailable)
 		case <-f.done:
 			return f.keys, f.err
 		}
 	}
 	if !k.lastAttempt.IsZero() {
 		if since := k.now().Sub(k.lastAttempt); since < k.floor {
+			failed := k.lastFailed
 			k.mu.Unlock()
+			if failed {
+				// The floor is all that stands between this request and
+				// an issuer that did not answer last time, so the key it
+				// needs may well exist: undecided, not rejected. Without
+				// this, a cold cache during an outage would answer the
+				// first request 503 and every request in the next
+				// KeyRefreshFloor 401 — the misreport this exists to fix.
+				return nil, fmt.Errorf("declined to refetch the key set from %s: last attempt was %s ago and failed, "+
+					"under the %s floor: %w", k.issuer, since.Round(time.Millisecond), k.floor, purser.ErrUnavailable)
+			}
+			// The last attempt succeeded, recently, and the cache it
+			// filled does not have this key. That is an answer — the
+			// unknown-key-ID case the floor exists for.
 			return nil, fmt.Errorf("declined to refetch the key set from %s: last attempt was %s ago, "+
 				"under the %s floor", k.issuer, since.Round(time.Millisecond), k.floor)
 		}
@@ -219,6 +236,7 @@ func (k *keySet) refreshKeys(ctx context.Context, since time.Time) (keys []jose.
 	release := func() {
 		k.mu.Lock()
 		f.keys, f.err = keys, err
+		k.lastFailed = err != nil
 		if err == nil {
 			k.keys = keys
 			k.fetchedAt = k.now()
@@ -231,7 +249,7 @@ func (k *keySet) refreshKeys(ctx context.Context, since time.Time) (keys []jose.
 		if r := recover(); r != nil {
 			// The waiters get an error; this goroutine keeps panicking,
 			// because a panic here is a bug and swallowing it hides one.
-			keys, err = nil, fmt.Errorf("panic fetching the key set from %s: %v", k.issuer, r)
+			keys, err = nil, fmt.Errorf("panic fetching the key set from %s: %v: %w", k.issuer, r, purser.ErrUnavailable)
 			release()
 			panic(r)
 		}
@@ -239,6 +257,17 @@ func (k *keySet) refreshKeys(ctx context.Context, since time.Time) (keys []jose.
 	}()
 
 	keys, err = k.fetch(ctx)
+	if err != nil {
+		// Whatever went wrong, the token did not cause it. It can
+		// trigger a fetch, by naming a key ID the cache has not seen,
+		// but not steer one: the issuer and the key endpoint come from
+		// configuration, and the discovery document is checked against
+		// them. So a failure here — the issuer down, a bad discovery
+		// document, a refused redirect, an empty key set — says nothing
+		// about the credential, and a client told otherwise would sign
+		// in again for nothing.
+		err = fmt.Errorf("%w: %w", err, purser.ErrUnavailable)
+	}
 	return keys, err
 }
 

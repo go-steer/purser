@@ -34,7 +34,9 @@ import (
 // Authenticator extracts a Caller from an inbound HTTP request.
 //
 // Authenticate returns purser.ErrUnauthenticated when the request
-// carries no valid credential. Contract for implementations:
+// carries no valid credential, and purser.ErrUnavailable when it could
+// not tell — a remote dependency it needs to decide did not answer.
+// Contract for implementations:
 //
 //   - A nil error means the credential was verified. Returning a
 //     zero-identity Caller with a nil error is a bug: downstream code
@@ -42,6 +44,11 @@ import (
 //   - Any error means no identity. Never return a partially populated
 //     Caller alongside an error; a consumer that ignores the error
 //     would then act on an unverified identity.
+//   - ErrUnauthenticated is the only error that is a verdict on the
+//     credential. httpmw maps it to 401 and everything else to 503, so
+//     a bad credential reported as a bare error tells the client to
+//     retry a request that will never succeed. The conformance suite
+//     holds missing and malformed credentials to ErrUnauthenticated.
 //   - A malformed credential is an error, not a panic. Inbound bytes
 //     are attacker-controlled.
 //   - Labels on the returned Caller must not alias state the

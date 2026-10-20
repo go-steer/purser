@@ -17,7 +17,6 @@ package oidc_test
 import (
 	"crypto/tls"
 	"crypto/x509"
-	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -25,7 +24,6 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/go-steer/purser"
 	"github.com/go-steer/purser/authn/oidc"
 	"github.com/go-steer/purser/authtest"
 )
@@ -145,9 +143,9 @@ func TestDiscoveryRefusals(t *testing.T) {
 				t.Fatalf("Authenticate succeeded as %q against a discovery document that must not "+
 					"be followed", c.Identity)
 			}
-			if !errors.Is(err, purser.ErrUnauthenticated) {
-				t.Errorf("error = %v, want purser.ErrUnauthenticated", err)
-			}
+			// Refused, but as an outage: the document came from the
+			// configured issuer, so nothing in the token chose it.
+			wantUnavailable(t, err)
 			if !strings.Contains(err.Error(), tt.wantErr) {
 				t.Errorf("error = %v, want it to mention %q", err, tt.wantErr)
 			}

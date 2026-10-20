@@ -686,6 +686,20 @@ is served. An IdP that is briefly down must not log every operator out
 of every service, and the request still has to present a token signed by
 that key and inside its validity window.
 
+When nothing cached matches, the failure is `purser.ErrUnavailable`, not
+`ErrUnauthenticated` — a 503, not a 401
+([#23](https://github.com/go-steer/purser/issues/23)). A token can make
+this package fetch, by naming a key ID it has not cached, but cannot
+choose what is fetched: the issuer and key endpoint come from
+configuration, and the discovery document is checked against them. So a
+failed fetch, a rejected discovery document, a refused redirect and an
+empty key set all say nothing about the token, and a client told 401
+would sign in again for nothing. The floor is classified by the attempt
+it is protecting: inside it after a *failed* fetch is still an outage,
+and inside it after a *successful* one, with the key ID absent, is the
+unknown-key verdict the floor exists for — a 401, so a forged token
+sprayed at a healthy issuer is never told to retry.
+
 **The discovery document must name the issuer it was fetched from.**
 This is the check that makes following discovery safe: without it,
 anything that can answer at the issuer's well-known path redirects the
@@ -1147,6 +1161,55 @@ the `authn/oidc` section above excludes. steward implements
 `httpmw.CallerMiddleware` like any other, and the one addition that
 middleware needs for this case, `CallerOptions.Challenge`, lets a
 protected resource name its RFC 9728 metadata in the 401.
+
+### Undecided is not rejected: 401 and 503
+
+`ErrUnauthenticated` is the only error that is a verdict on the
+credential. Until [#23](https://github.com/go-steer/purser/issues/23)
+`httpmw.CallerMiddleware` mapped every authentication error to 401 and
+logged none of them, so an authenticator whose remote dependency was
+down — steward asking Google about a token, a directory lookup for group
+membership, `authn/oidc` with a cold key cache — looked from the outside
+exactly like a bad credential. That is not cosmetic. A client reads 401
+as "discard this credential and sign in again"; an MCP client re-runs
+OAuth. During an outage on the server's side that sends every user back
+through sign-in at once, for credentials that were fine, while the
+operator sees nothing.
+
+So under `Enforce`:
+
+| Authenticator returned | Response |
+|---|---|
+| `ErrUnauthenticated` | 401, `WWW-Authenticate: <Challenge>`, logged at Debug |
+| `ErrUnavailable` | 503, `Retry-After`, no challenge, logged at Warn |
+| anything else | the same as `ErrUnavailable` |
+| both sentinels | the same as `ErrUnavailable` |
+
+An unrecognized error is a 503 because it is not a verdict either, and a
+conforming authenticator never returns one for a bad credential — the
+conformance suite holds missing and malformed credentials to
+`ErrUnauthenticated`. Precedence goes to `ErrUnavailable` for the
+composite case: an authenticator that tried two verifiers, one of which
+could not answer, has not rejected the credential, since the one that
+could not answer might have accepted it. The suite closes the loop by
+rejecting an authenticator that wraps `ErrUnavailable` on a missing or
+malformed credential, which would otherwise pass every check and still
+draw a 503.
+
+The 503 carries no challenge, because a challenge is an invitation to
+authenticate afresh. 401s are logged at Debug, because every
+unauthenticated probe on the internet produces one; outages at Warn,
+except where the request's context was canceled — a client that hung up
+is not an outage. Canceled specifically: a server-side deadline ends the
+context with `DeadlineExceeded`, and a dependency slow enough to trip
+one is the outage.
+
+Without `Enforce` the request still falls back, as it always has, and
+the Warn is the only trace that a signed-in user was served as the
+fallback for the length of the outage. Whether a surface that permits
+anonymous access should instead refuse a credential it could not check
+is an open question; it is left as it was because downgrading to less
+privilege fails safe, and changing it is a separate decision.
 
 ### `authtest` — the component-testing payoff
 

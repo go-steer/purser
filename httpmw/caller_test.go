@@ -16,6 +16,7 @@ package httpmw
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
@@ -292,7 +293,8 @@ func TestCallerRejectionDoesNotLeakTheReason(t *testing.T) {
 // An authenticator that returns something other than
 // ErrUnauthenticated — a JWKS fetch that failed, a torn credential
 // file — must not be treated as a successful authentication. It has no
-// identity to offer either way.
+// identity to offer either way. Enforced, it is a 503 rather than a
+// 401; see TestCallerUndecidedIs503.
 func TestCallerNonSentinelErrorIsStillAFailure(t *testing.T) {
 	t.Parallel()
 	boom := errors.New("purser: issuer keys unavailable")
@@ -311,12 +313,177 @@ func TestCallerNonSentinelErrorIsStillAFailure(t *testing.T) {
 		t.Errorf("auth source = %q, want anonymous: the authenticator failed", got.source)
 	}
 
-	_, rec = serve(t, mustCaller(t, CallerOptions{
+	got, rec = serve(t, mustCaller(t, CallerOptions{
 		Authenticator: fakeAuth{err: boom, source: purser.AuthSourceOIDC},
 		Enforce:       true,
 	}), get())
-	if rec.Code != http.StatusUnauthorized {
-		t.Errorf("enforcing status = %d, want 401", rec.Code)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("enforcing status = %d, want 503", rec.Code)
+	}
+	if got.ran {
+		t.Error("the handler ran on a request whose authenticator failed")
+	}
+}
+
+// TestCallerUndecidedIs503 is go-steer/purser#23. An authenticator that
+// could not reach a verdict — its issuer down, its directory
+// unreachable — must not answer 401, because a client reads 401 as "your
+// credential is bad" and signs in again: an MCP client re-runs OAuth,
+// for every user, for a credential that was fine.
+func TestCallerUndecidedIs503(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		err  error
+		want int
+	}{
+		{"ErrUnauthenticated", fmt.Errorf("bad token: %w", purser.ErrUnauthenticated), http.StatusUnauthorized},
+		{"ErrUnavailable", fmt.Errorf("issuer down: %w", purser.ErrUnavailable), http.StatusServiceUnavailable},
+		{"neither", errors.New("torn credential file"), http.StatusServiceUnavailable},
+		// Precedence. A composite authenticator that tried two
+		// verifiers, one of which could not answer, has not rejected
+		// the credential: the one that could not answer might have
+		// accepted it.
+		{"both", errors.Join(purser.ErrUnauthenticated, purser.ErrUnavailable), http.StatusServiceUnavailable},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got, rec := serve(t, mustCaller(t, CallerOptions{
+				Authenticator: fakeAuth{err: tc.err, source: purser.AuthSourceOIDC},
+				Enforce:       true,
+			}), get())
+
+			if rec.Code != tc.want {
+				t.Fatalf("status = %d, want %d", rec.Code, tc.want)
+			}
+			if got.ran {
+				t.Error("the handler ran on a request that did not authenticate")
+			}
+			challenge := rec.Header().Get("WWW-Authenticate")
+			retry := rec.Header().Get("Retry-After")
+			if tc.want == http.StatusServiceUnavailable {
+				// A challenge is an invitation to sign in afresh,
+				// which is the reaction the 503 exists to prevent.
+				if challenge != "" {
+					t.Errorf("WWW-Authenticate = %q on a 503, want none", challenge)
+				}
+				if retry == "" {
+					t.Error("no Retry-After on the 503")
+				}
+				if strings.Contains(rec.Body.String(), "issuer down") || strings.Contains(rec.Body.String(), "torn") {
+					t.Errorf("503 body leaked the reason: %q", rec.Body)
+				}
+				return
+			}
+			if challenge == "" {
+				t.Error("no WWW-Authenticate on the 401")
+			}
+			if retry != "" {
+				t.Errorf("Retry-After = %q on a 401: retrying a rejected credential cannot succeed", retry)
+			}
+		})
+	}
+}
+
+// The issue's second half: "the operator sees nothing". An outage is
+// logged at Warn with the authenticator's source and reason, and so is
+// one behind a non-enforcing surface, where the request proceeds as the
+// fallback and a signed-in user would otherwise be served as anonymous
+// with no trace anywhere.
+func TestCallerUndecidedIsLogged(t *testing.T) {
+	t.Parallel()
+	for _, enforce := range []bool{true, false} {
+		t.Run(fmt.Sprintf("enforce=%v", enforce), func(t *testing.T) {
+			t.Parallel()
+			var logs bytes.Buffer
+			mw := mustCaller(t, CallerOptions{
+				Authenticator: fakeAuth{err: fmt.Errorf("jwks: connection refused: %w", purser.ErrUnavailable), source: purser.AuthSourceOIDC},
+				Enforce:       enforce,
+				Logger:        slog.New(slog.NewTextHandler(&logs, nil)),
+			})
+			serve(t, mw, get())
+
+			out := logs.String()
+			for _, want := range []string{"level=WARN", "source=oidc", "connection refused"} {
+				if !strings.Contains(out, want) {
+					t.Errorf("log = %q, want it to contain %q", out, want)
+				}
+			}
+		})
+	}
+}
+
+// A 401 is logged too, which the writeUnauthorized doc comment always
+// promised and resolve never did — but at Debug, since every
+// unauthenticated request on the internet produces one.
+func TestCallerRejectionIsLoggedAtDebug(t *testing.T) {
+	t.Parallel()
+	var logs bytes.Buffer
+	mw := mustCaller(t, CallerOptions{
+		Authenticator: tableAuth(t),
+		Enforce:       true,
+		Logger:        slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
+	})
+	r := get()
+	r.Header.Set("Authorization", "Bearer tok_nobody")
+	serve(t, mw, r)
+
+	out := logs.String()
+	if !strings.Contains(out, "level=DEBUG") || !strings.Contains(out, "unknown token") {
+		t.Errorf("log = %q, want a Debug line carrying the authenticator's reason", out)
+	}
+	if strings.Contains(out, "level=WARN") {
+		t.Errorf("log = %q: a rejected credential is not an outage", out)
+	}
+}
+
+// A client that hangs up mid-request cancels its context, the
+// authenticator's remote call fails with it, and that is not an outage.
+// Logging it at Warn would alert on every closed tab.
+func TestCallerUndecidedAfterClientLeftIsNotAWarning(t *testing.T) {
+	t.Parallel()
+	var logs bytes.Buffer
+	mw := mustCaller(t, CallerOptions{
+		Authenticator: fakeAuth{err: fmt.Errorf("introspect: %w: %w", context.Canceled, purser.ErrUnavailable), source: purser.AuthSourceOIDC},
+		Enforce:       true,
+		Logger:        slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	serve(t, mw, get().WithContext(ctx))
+
+	out := logs.String()
+	if strings.Contains(out, "level=WARN") {
+		t.Errorf("log = %q, want no Warn for a client that had already gone", out)
+	}
+	if !strings.Contains(out, "level=DEBUG") {
+		t.Errorf("log = %q, want it kept at Debug", out)
+	}
+}
+
+// The exception is the client leaving, not the context ending. A
+// deadline the server set itself — http.TimeoutHandler, say — ends it
+// with DeadlineExceeded, and an authenticator whose dependency is slow
+// enough to trip that is the outage, not a closed tab.
+func TestCallerUndecidedAtServerDeadlineIsAWarning(t *testing.T) {
+	t.Parallel()
+	var logs bytes.Buffer
+	mw := mustCaller(t, CallerOptions{
+		Authenticator: fakeAuth{err: fmt.Errorf("tokeninfo: %w: %w", context.DeadlineExceeded, purser.ErrUnavailable), source: purser.AuthSourceGoogleAccessToken},
+		Enforce:       true,
+		Logger:        slog.New(slog.NewTextHandler(&logs, nil)),
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 0)
+	defer cancel()
+	<-ctx.Done()
+	_, rec := serve(t, mw, get().WithContext(ctx))
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503", rec.Code)
+	}
+	if out := logs.String(); !strings.Contains(out, "level=WARN") {
+		t.Errorf("log = %q, want a Warn: the server's own deadline expiring is not the client leaving", out)
 	}
 }
 

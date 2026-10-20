@@ -206,6 +206,10 @@ func TestSentinelErrorsAreDistinct(t *testing.T) {
 		purser.ErrUnauthenticated,
 		purser.ErrAssertedCallerForbidden,
 		purser.ErrAssertedCallerUnknown,
+		// Above all distinct from ErrUnauthenticated: the two map to 401
+		// and 503, and the difference is whether a client signs in
+		// again (#23).
+		purser.ErrUnavailable,
 	}
 	for i, a := range all {
 		for j, b := range all {

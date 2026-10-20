@@ -392,6 +392,18 @@ func TestCheckNoCredentialDetectsWrongSentinel(t *testing.T) {
 	wantReported(t, runCheck(t, "NoCredential", s), "rejects without wrapping ErrUnauthenticated")
 }
 
+// Wrapping ErrUnavailable as well as ErrUnauthenticated satisfies the
+// sentinel check, and httpmw would still answer 503: it gives
+// ErrUnavailable precedence. A missing credential is a verdict.
+func TestCheckNoCredentialDetectsUnavailableAlongsideTheVerdict(t *testing.T) {
+	t.Parallel()
+
+	s := refSubject(stubAuth{authFn: func(*http.Request) (purser.Caller, error) {
+		return purser.Caller{}, errors.Join(purser.ErrUnauthenticated, purser.ErrUnavailable)
+	}})
+	wantReported(t, runCheck(t, "NoCredential", s), "wraps ErrUnavailable alongside the verdict")
+}
+
 func TestCheckNoCredentialDetectsCallerAlongsideError(t *testing.T) {
 	t.Parallel()
 
@@ -516,6 +528,15 @@ func TestCheckMalformedCredentialDetectsWrongSentinel(t *testing.T) {
 		return purser.Caller{}, errors.New("malformed")
 	}})
 	wantReported(t, runCheck(t, "MalformedCredential", s), "rejects without wrapping ErrUnauthenticated")
+}
+
+func TestCheckMalformedCredentialDetectsUnavailableAlongsideTheVerdict(t *testing.T) {
+	t.Parallel()
+
+	s := refSubject(stubAuth{authFn: func(*http.Request) (purser.Caller, error) {
+		return purser.Caller{}, fmt.Errorf("garbled: %w: %w", purser.ErrUnauthenticated, purser.ErrUnavailable)
+	}})
+	wantReported(t, runCheck(t, "MalformedCredential", s), "wraps ErrUnavailable alongside the verdict")
 }
 
 func TestCheckMalformedCredentialDetectsCallerAlongsideError(t *testing.T) {
