@@ -111,8 +111,10 @@ Conventions worth knowing at agent prompt time:
   "Changing the exported API" in [`CONTRIBUTING.md`](./CONTRIBUTING.md).
 - **`[Unreleased]` grows on every merged PR.** Any user-visible change adds a
   bullet under `## [Unreleased]` in `CHANGELOG.md` as part of the PR. Cutting a
-  release closes that section and empties `dev/api-breaks.txt` — the procedure
-  is "Cutting a release" in [`CONTRIBUTING.md`](./CONTRIBUTING.md).
+  release closes that section; `dev/api-breaks.txt` is emptied in a follow-up
+  PR *after* the tag, because the release PR's apidiff check still compares
+  against the previous one. The procedure is "Cutting a release" in
+  [`CONTRIBUTING.md`](./CONTRIBUTING.md).
 - **Harness settings are not committed.** `.claude/` (and a personal `CLAUDE.md`)
   are git-ignored; the repo-native enforcement is this file + the required CI
   check. The only checked-in Claude Code config is the opt-in sample under
@@ -123,11 +125,12 @@ Conventions worth knowing at agent prompt time:
 **Phase 1a complete.** The identity contract, `authtest` and its conformance
 suite, the bearer-token table, both mTLS profiles, `client`, `httpmw`,
 `authn/oidc`, and `authz` are all in, with a worked example under `examples/`
-and per-package coverage floors over the lot. Tagged `v0.1.0`, which is what
-gave `verify-apidiff` its first baseline — before that tag it skipped every
-run — and now `v0.2.0` (`proxy-header` and `google-access-token` auth
-sources, `CallerOptions.Challenge` for steward, Go 1.26.9). Pre-1.0 the exported API may still break at a minor version, but it is
-what phase 2 will migrate `core-agent` and `mast` onto, so changing it is a
-design conversation, not a refactor — and never a silent one. Phase 1b
+and per-package coverage floors over the lot. Released as tagged versions —
+`CHANGELOG.md` is the list, newest first; `v0.1.0` gave `verify-apidiff` its
+first baseline, before which it skipped every run. `steward`, `k8s-lookout`
+and `mast-web` already depend on it. Pre-1.0 the exported API may still break
+at a minor version (v0.4.0 did, for `authn.IdentityLookup`), but it is what
+phase 2 will migrate `core-agent` and `mast` onto, so changing it is a design
+conversation, not a refactor — and never a silent one. Phase 1b
 (service-mesh / sidecar-terminated TLS) is optional and unstarted; see the
 phase table in [`docs/DESIGN.md`](./docs/DESIGN.md).
