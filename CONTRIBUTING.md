@@ -75,11 +75,11 @@ that check quietly stops working.
    *Nothing yet.*, and add the two link references at the bottom of the
    file (`[Unreleased]` compares `vX.Y.Z...HEAD`; `[X.Y.Z]` points at the
    release tag).
-3. **Empty [`dev/api-breaks.txt`](./dev/api-breaks.txt).** Once the tag
-   moves, those breaks sit behind the new baseline; a leftover entry would
-   silently permit a second, unrelated removal of a symbol that is already
-   gone. Leave the header comments, drop the entries, and update the
-   trailing note to name the new version.
+3. **Update the trailing note in [`dev/api-breaks.txt`](./dev/api-breaks.txt)**
+   to name the new version. If the file has entries, leave them for now:
+   `verify-apidiff` compares against the nearest tag, which is still the
+   previous release until this PR is tagged, so emptying it here fails
+   the release PR's required apidiff check.
 4. **Merge that as its own `chore/release-vX.Y.Z` PR**, so the tag lands on
    a commit whose changelog already describes it.
 5. **Tag the merge commit and push it:**
@@ -89,6 +89,11 @@ that check quietly stops working.
    ```
 6. **Verify the baseline took.** `dev/tools/verify-apidiff` should now
    report against the new tag instead of skipping.
+7. **Empty `dev/api-breaks.txt` if it had entries,** in a follow-up PR now
+   that the tag is the baseline. Once the tag moves, those breaks sit
+   behind it; a leftover entry would silently permit a second, unrelated
+   removal of a symbol that is already gone. Leave the header comments,
+   drop the entries, and keep the trailing note naming the new version.
 
 Which number: pre-1.0, a breaking change is a **minor** bump (`v0.2.0`),
 not a major one — `v0.x` reserves that right and the module path stays
