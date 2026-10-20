@@ -20,6 +20,8 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
+	"slices"
 	"strings"
 
 	"github.com/go-steer/purser"
@@ -67,8 +69,11 @@ type CallerOptions struct {
 
 	// Logger receives the rejected-assertion audit line, a Warn for
 	// every request whose authenticator could not reach a verdict, and
-	// a Debug for every 401 naming the authenticator's reason. Nil
-	// means slog.Default().
+	// a Debug for every 401 naming the authenticator's reason. The
+	// request's own credential is removed from that reason before it is
+	// logged, as a backstop for an authenticator that quotes it; see
+	// scrubbed for what that does and does not catch. Nil means
+	// slog.Default().
 	Logger *slog.Logger
 
 	// Challenge is the WWW-Authenticate value sent with every 401 this
@@ -318,7 +323,7 @@ func (m *CallerMiddleware) resolve(w http.ResponseWriter, r *http.Request) (purs
 				writeUnavailable(w)
 			} else {
 				m.log.DebugContext(r.Context(), "purser: authentication rejected",
-					"source", m.authenticator.Source(), "err", err)
+					"source", m.authenticator.Source(), "err", scrubbed(r, err))
 				m.writeUnauthorized(w, err)
 			}
 			return purser.Caller{}, "", false, false
@@ -359,11 +364,85 @@ func (m *CallerMiddleware) logUnavailable(r *http.Request, err error) {
 	ctx := r.Context()
 	if errors.Is(ctx.Err(), context.Canceled) {
 		m.log.DebugContext(ctx, "purser: authenticator could not reach a verdict; the client had already gone",
-			"source", m.authenticator.Source(), "err", err)
+			"source", m.authenticator.Source(), "err", scrubbed(r, err))
 		return
 	}
 	m.log.WarnContext(ctx, "purser: authenticator could not reach a verdict",
-		"source", m.authenticator.Source(), "enforce", m.enforce, "err", err)
+		"source", m.authenticator.Source(), "enforce", m.enforce, "err", scrubbed(r, err))
+}
+
+// redacted stands in for credential material removed from a log line.
+const redacted = "[REDACTED]"
+
+// minScrubLen is the shortest credential scrubbed is willing to remove.
+// Below it, replacing every occurrence would make the line unreadable —
+// a two-byte token turns every word containing those two bytes into a
+// redaction — while protecting a credential short enough to guess.
+const minScrubLen = 8
+
+// scrubbed returns err's text with the request's own credential removed.
+//
+// The errors these log lines record come from the authenticator, which
+// may not be purser's: a third-party implementation that quotes the
+// token it rejected ("unknown token %q") would otherwise put a live
+// credential into the log, at Debug for every bad one and at Warn for
+// every one presented during an outage. purser's own authenticators and
+// steward's never do; this makes it impossible rather than unlikely.
+//
+// It is a backstop, not a guarantee. It removes what this request
+// carried in the headers purser's authenticators read — Authorization,
+// whole and with its scheme stripped, and authn.HeaderAttachToken — as
+// sent and in both URL encodings, since an error from net/url or a
+// request built from the token quotes it that way. A credential the
+// authenticator read from somewhere else, or transformed before quoting
+// (truncated, decoded, re-encoded), passes through, as does a second
+// value of either header. Not quoting the credential remains the
+// authenticator's job.
+//
+// A client can choose its own credential, and so choose what is
+// redacted from the lines its own failed requests produce: an
+// Authorization of "Bearer connection refused" blanks that phrase out of
+// its own Warn. That hides nothing about anyone else's request, and the
+// line itself — source, level, the fact of the failure — still appears.
+func scrubbed(r *http.Request, err error) string {
+	msg := err.Error()
+	for _, secret := range credentials(r) {
+		msg = strings.ReplaceAll(msg, secret, redacted)
+	}
+	return msg
+}
+
+// credentials lists every form of the request's credential that
+// scrubbed removes. Longest first, so a whole header value is replaced
+// as one redaction before the bare token inside it is looked for.
+func credentials(r *http.Request) []string {
+	var out []string
+	add := func(v string) {
+		v = strings.TrimSpace(v)
+		if len(v) < minScrubLen {
+			return
+		}
+		for _, form := range []string{v, url.QueryEscape(v), url.PathEscape(v)} {
+			if !slices.Contains(out, form) {
+				out = append(out, form)
+			}
+		}
+	}
+	// The first value of each header only — what Header.Get returns, and
+	// so what an authenticator reads. Every value would let a client
+	// that sends thousands of Authorization lines, inside net/http's
+	// header limit, choose how much work each rejected request costs.
+	auth := r.Header.Get("Authorization")
+	add(auth)
+	// The token without its scheme, which is what an authenticator that
+	// parsed the header would quote. The scheme itself is never a
+	// candidate: "Bearer" is in half the messages worth logging.
+	if _, cred, ok := strings.Cut(strings.TrimSpace(auth), " "); ok {
+		add(cred)
+	}
+	add(r.Header.Get(authn.HeaderAttachToken))
+	slices.SortStableFunc(out, func(a, b string) int { return len(b) - len(a) })
+	return out
 }
 
 // inherited returns source, or the verdict an outer middleware already

@@ -24,6 +24,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -484,6 +486,138 @@ func TestCallerUndecidedAtServerDeadlineIsAWarning(t *testing.T) {
 	}
 	if out := logs.String(); !strings.Contains(out, "level=WARN") {
 		t.Errorf("log = %q, want a Warn: the server's own deadline expiring is not the client leaving", out)
+	}
+}
+
+// The log lines #23 added record the authenticator's error, and the
+// authenticator may not be purser's. One that quotes the token it was
+// handed must not put a live credential in the log — at Warn on the
+// outage path, at Debug on the rejection path.
+func TestCallerLogLinesDoNotCarryTheCredential(t *testing.T) {
+	t.Parallel()
+	const token = "tok_live_9f8e7d6c5b4a" //nolint:gosec // G101: a test value, not a credential
+	cases := []struct {
+		name string
+		err  error
+	}{
+		{"outage, logged at Warn", fmt.Errorf("introspecting %q: %w", token, purser.ErrUnavailable)},
+		{"rejection, logged at Debug", fmt.Errorf("unknown token %s: %w", token, purser.ErrUnauthenticated)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var logs bytes.Buffer
+			mw := mustCaller(t, CallerOptions{
+				Authenticator: fakeAuth{err: tc.err, source: purser.AuthSourceBearer},
+				Enforce:       true,
+				Logger:        slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
+			})
+			r := get()
+			r.Header.Set("Authorization", "Bearer "+token)
+			serve(t, mw, r)
+
+			out := logs.String()
+			if out == "" {
+				t.Fatal("nothing was logged; the test would pass without scrubbing")
+			}
+			if strings.Contains(out, token) {
+				t.Errorf("log = %q, carries the request's credential", out)
+			}
+			if !strings.Contains(out, redacted) {
+				t.Errorf("log = %q, want the credential replaced by %s", out, redacted)
+			}
+		})
+	}
+}
+
+// TestScrubbedForms covers each form a credential can take on its way
+// into an error message.
+func TestScrubbedForms(t *testing.T) {
+	t.Parallel()
+	// Characters that both URL encodings change, so the escaped forms
+	// differ from the raw one and from each other.
+	const token = "abc/def+ghi=jkl mno" //nolint:gosec // G101: a test value, not a credential
+	cases := []struct {
+		name   string
+		header string
+		value  string
+		msg    string
+	}{
+		{"bare token from Authorization", "Authorization", "Bearer " + token, "unknown token " + token},
+		{"whole Authorization value", "Authorization", "Bearer " + token, `bad header "Bearer ` + token + `"`},
+		{"query-escaped", "Authorization", "Bearer " + token, "GET https://idp.example/introspect?token=" + url.QueryEscape(token)},
+		{"path-escaped", "Authorization", "Bearer " + token, "GET https://idp.example/tokens/" + url.PathEscape(token)},
+		{"side-channel header", authn.HeaderAttachToken, token, "unknown attach token " + token},
+		{"scheme in another case", "Authorization", "bearer " + token, "unknown token " + token},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			r := get()
+			r.Header.Set(tc.header, tc.value)
+			got := scrubbed(r, errors.New(tc.msg))
+
+			for _, leaked := range []string{token, url.QueryEscape(token), url.PathEscape(token)} {
+				if strings.Contains(got, leaked) {
+					t.Errorf("scrubbed = %q, still carries %q", got, leaked)
+				}
+			}
+			if !strings.Contains(got, redacted) {
+				t.Errorf("scrubbed = %q, want %s in it", got, redacted)
+			}
+		})
+	}
+}
+
+// Scrubbing must not cost the line its meaning: the scheme is not a
+// secret, a request with no credential has nothing to remove, and a
+// credential under minScrubLen is left alone rather than redacting every
+// word that happens to contain it.
+func TestScrubbedLeavesTheRestReadable(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name  string
+		value string
+		msg   string
+	}{
+		{"the scheme", "Bearer tok_live_9f8e7d6c5b4a", "Bearer scheme required, got Basic"},
+		{"no credential", "", "no token presented"},
+		{"a credential under the threshold", "Bearer ab", "unknown token: absent from table"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			r := get()
+			if tc.value != "" {
+				r.Header.Set("Authorization", tc.value)
+			}
+			if got := scrubbed(r, errors.New(tc.msg)); got != tc.msg {
+				t.Errorf("scrubbed = %q, want it unchanged: %q", got, tc.msg)
+			}
+		})
+	}
+}
+
+// Only the first value of each header is a candidate — what Header.Get
+// returns and authenticators read. Considering every value would let a
+// client that sends thousands of Authorization lines set the cost of
+// each rejected request.
+func TestScrubbedConsidersTheFirstValueOnly(t *testing.T) {
+	t.Parallel()
+	r := get()
+	r.Header.Add("Authorization", "Bearer first_token_value")
+	for i := 0; i < 1000; i++ {
+		r.Header.Add("Authorization", fmt.Sprintf("Bearer filler_token_%04d", i))
+	}
+
+	got := credentials(r)
+	for _, c := range got {
+		if strings.Contains(c, "filler") {
+			t.Fatalf("credentials = %d candidates including %q; want only the first header value's forms", len(got), c)
+		}
+	}
+	if !slices.Contains(got, "first_token_value") {
+		t.Errorf("credentials = %q, want the first value's token among them", got)
 	}
 }
 
