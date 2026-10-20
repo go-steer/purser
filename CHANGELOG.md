@@ -12,6 +12,20 @@ in [`CONTRIBUTING.md`](./CONTRIBUTING.md).
 
 ## [Unreleased]
 
+*Nothing yet.*
+
+## [0.3.0] - 2026-10-20
+
+An authenticator that could not reach a verdict (its issuer's keys, the
+endpoint it asks, or the directory it resolves groups against did not
+answer) now gets a 503 with `Retry-After` from `httpmw`, not a 401, and
+is logged. A client told 401 discards a credential that may be fine and
+signs in again, which during an outage sends every user back through
+sign-in at once. `purser.ErrUnavailable` is how an authenticator says so
+on purpose; an error matching neither sentinel is treated the same way.
+This is a behavior change for authenticators that report bad credentials
+with anything other than `purser.ErrUnauthenticated` (#23).
+
 ### Added
 - `purser.ErrUnavailable`: the sentinel for an authenticator that could not
   reach a verdict at all — the issuer's keys would not load, the endpoint it
@@ -570,6 +584,7 @@ reported by apidiff, acknowledged in
   and why they verify with opposite `crypto/tls` idioms, the admission /
   identity split, the phase plan, and the verification each phase owes.
 
-[Unreleased]: https://github.com/go-steer/purser/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/go-steer/purser/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/go-steer/purser/releases/tag/v0.3.0
 [0.2.0]: https://github.com/go-steer/purser/releases/tag/v0.2.0
 [0.1.0]: https://github.com/go-steer/purser/releases/tag/v0.1.0
