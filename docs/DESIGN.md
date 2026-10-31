@@ -274,6 +274,8 @@ purser/
       pkix.go                NewPKI() -> (*tls.Config, *PKIAuth) (stdlib only)
       spiffe.go              NewSPIFFE() -> (*tls.Config, *SPIFFEAuth)
       spiffefiles.go         SPIFFEFileSource: file-backed, reloading SVID + bundle
+      certfiles.go           CertificateFileSource, CertPoolFileSource: file-backed,
+                             reloading PKI certificate and trust anchors
       match.go               admission matchers, both profiles
     oidc/
       oidc.go                Options, New() -> *Auth, token extraction + JWS verify
@@ -298,6 +300,7 @@ purser/
     issuer.go                fake OIDC issuer (httptest + JWKS)
   internal/
     ca/                      the CA core, error-returning; authtest wraps it
+    filereload/              the reload loop every file-backed source shares
     tlsfloor/                the TLS version floor, shared by client and server
 ```
 
@@ -517,6 +520,57 @@ so `go.mod` gains one direct requirement and no indirect ones. The gRPC
 and go-jose dependencies live in `workloadapi`, which purser does not
 import — a consumer that wants the SPIRE agent socket takes them on
 knowingly.
+
+### `authn/mtls` — file-backed PKI credentials and Kubernetes pod certificates
+
+`SPIFFEFileSource` covers the SPIFFE profile. The PKI profile needs the
+same thing — a certificate and a trust pool that a platform rewrites in
+place — and Kubernetes now delivers both as files to any pod:
+
+- a **`podCertificate` projected volume** carries the pod's own key and
+  certificate, issued by a named signer and refreshed by the kubelet
+  before expiry. Its `credentialBundlePath` layout is *one* file — a
+  PKCS#8 `PRIVATE KEY` block followed by the chain — and its
+  `keyPath`/`certificateChainPath` layout is two;
+- a **`clusterTrustBundle` projection** carries a signer's trust
+  anchors, and changes when the signer rotates its CA.
+
+The first consumer is Agent Substrate's ingress router, which from
+v0.6 accepts only mTLS. Its clients present a certificate from the
+`podidentity.podcert.ate.dev/identity` signer — an X.509-SVID for
+`spiffe://cluster.local/ns/<ns>/sa/<sa>` — but the router's own
+certificate comes from a different signer (`servicedns`) and carries DNS
+SANs only. There is no server SPIFFE ID to authorize, so the client
+dials with the **PKI** profile: chain to the servicedns anchors, name
+`atenet-router.ate-system.svc`. That is the case the hard rule "SPIFFE
+is the goal, never the requirement" exists for, so the new sources are
+profile-neutral:
+
+- **`CertificateFileSource`** serves a certificate from either layout,
+  through `GetCertificate` (a listener's `PKIOptions`) and
+  `GetClientCertificate` (a dialer's `client.PKIOptions`). It refuses an
+  expired leaf rather than presenting it.
+- **`CertPoolFileSource`** serves a trust pool, cloned per call because
+  `x509.CertPool` is mutable.
+- **`SPIFFEFileOptions.CredentialBundlePath`** lets `SPIFFEFileSource`
+  read the one-file layout too, for SPIFFE-profile peers on the same
+  platform.
+
+All three share `internal/filereload`, which is `SPIFFEFileSource`'s
+reload loop moved out unchanged: the synchronous first load, polling on
+a goroutine of its own, the double read against torn writes, the last
+good value kept on failure, and the serialised, bounded, panic-safe
+`OnError`. The design notes above apply to each source. The PEM parsing
+on top is strict for the same reason: exactly one key, at least one
+certificate, no other block types, and nothing after the last complete
+block — `encoding/pem` stops quietly at a partial block, so trailing
+bytes are how a torn bundle shows itself.
+
+A lazy alternative — reload on the first handshake after the interval,
+as the worked example's `pkiCertSource` does — needs no goroutine and no
+`Close`, but puts the file read on the handshake path, where a wedged
+mount stalls every connection. A library should not make that trade for
+its callers.
 
 ### `authn/mtls` — admission matchers
 
@@ -977,6 +1031,30 @@ follow-on)."*
 Both profiles: a stdlib `tls.Config` with a keypair plus `RootCAs` for
 PKI, and an SVID plus a bundle source for SPIFFE. Without this, phase 2
 ships a server that nothing can talk to.
+
+**Rotating PKI roots.** `crypto/tls` reads `RootCAs` from the config, so
+a pool that changes cannot be expressed through it. `PKIOptions.RootCAsSource`
+(satisfied by `mtls.CertPoolFileSource`) takes its place: the
+constructor sets `InsecureSkipVerify` and `VerifyConnection` does what
+`crypto/tls` would have done against the pool current at that handshake —
+chain to a root, `serverAuth`, the server name, and in FIPS 140 mode
+`crypto/tls`'s own key filter on the chain. The name is the one
+`crypto/tls` sent in SNI, so a caller who clones the config and changes
+`ServerName` has that name verified; for an IP, which SNI cannot carry,
+it is the `ServerName` given to `NewPKI`, and an IP dial with neither is
+refused, since the dialed address is not visible from the hook. Because
+the hook is `VerifyConnection`, a resumed session is checked against
+today's pool too. This is the same structure as the SPIFFE profile
+below, for the same reason.
+
+Three differences from `RootCAs` are documented on the field rather than
+engineered away: `VerifiedChains` is empty; `Config.Time` is not
+consulted; and with a caller-supplied `ClientSessionCache`, a session
+cached before a rotation fails its first resumption instead of being
+skipped. `crypto/tls` re-checks a cached chain against `RootCAs` in
+`loadSession`, but only inside `!InsecureSkipVerify`. The failed session
+is evicted, so the cost is one failed request per cached session per
+rotation, and only for a caller who opted in to a cache.
 
 **The client verifies where the server verifies.** This design
 originally said to return `tlsconfig.MTLSClientConfig(svid, bundle,

@@ -12,7 +12,31 @@ in [`CONTRIBUTING.md`](./CONTRIBUTING.md).
 
 ## [Unreleased]
 
-*Nothing yet.*
+### Added
+- `mtls.CertificateFileSource` (`mtls.NewCertificateFileSource`): a
+  certificate and key read from files and re-read on an interval, for the
+  PKI profile on either end of a connection (`GetCertificate`,
+  `GetClientCertificate`). It reads a Kubernetes `podCertificate`
+  projection in either layout — the single `credentialBundlePath` file
+  (key, then chain) or `keyPath` plus `certificateChainPath` — and refuses
+  an expired leaf rather than presenting it.
+- `mtls.CertPoolFileSource` (`mtls.NewCertPoolFileSource`): a trust pool
+  read from a PEM file, such as a `clusterTrustBundle` projection, and
+  re-read on an interval. `CertPool` returns a copy per call.
+- `client.PKIOptions.RootCAsSource` and the `client.RootCAsSource`
+  interface: trust anchors consulted per handshake, so a CA rotation needs
+  no restart. Chain, `serverAuth` and server name are verified in
+  `VerifyConnection`, including on resumed sessions. Mutually exclusive
+  with `RootCAs`.
+- `mtls.SPIFFEFileOptions.CredentialBundlePath`: `SPIFFEFileSource` reads
+  the single-file pod-certificate layout as an alternative to `CertPath`
+  and `KeyPath`.
+
+### Changed
+- `SPIFFEFileSource` runs on the reload loop now shared by every
+  file-backed source (`internal/filereload`). Behavior is unchanged; a
+  torn-read error now names the file that changed ("SVID chain at …
+  changed while being read") rather than the directory.
 
 ## [0.4.0] - 2026-10-20
 

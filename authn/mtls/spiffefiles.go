@@ -15,18 +15,16 @@
 package mtls
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
-	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/spiffe/go-spiffe/v2/bundle/x509bundle"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	"github.com/spiffe/go-spiffe/v2/svid/x509svid"
+
+	"github.com/go-steer/purser/internal/filereload"
 )
 
 // GKE's managed workload identity delivers credentials as files, not
@@ -50,23 +48,25 @@ const (
 	GKEBundleFile = "ca_certificates.pem"
 )
 
-// defaultReloadInterval is how often SPIFFEFileSource re-reads its
-// files when ReloadInterval is unset.
-//
-// Parsing three small PEM documents is far cheaper than being wrong
-// about a rotation, so this errs toward freshness. It is well under
-// GKE's roughly five-minute trust-anchor propagation delay, which is
-// the real floor on how quickly a withdrawal can take effect.
-const defaultReloadInterval = 30 * time.Second
-
 // SPIFFEFileOptions configures NewSPIFFEFileSource.
 type SPIFFEFileOptions struct {
 	// CertPath, KeyPath, and BundlePath are the PEM files holding the
 	// SVID chain (leaf first), its private key, and the X.509 trust
-	// anchors. All three are required.
+	// anchors. BundlePath is required, and so is either the CertPath
+	// and KeyPath pair or CredentialBundlePath.
 	CertPath   string
 	KeyPath    string
 	BundlePath string
+
+	// CredentialBundlePath is a single PEM file holding the private key
+	// and the SVID chain, leaf first: the credentialBundlePath layout of
+	// a Kubernetes podCertificate projected volume, as Agent
+	// Substrate's podidentity signer issues. It replaces CertPath and
+	// KeyPath and is mutually exclusive with them. See
+	// CertificateFileOptions.CredentialBundlePath for the format; here
+	// the key must be PKCS#8 ("PRIVATE KEY"), as go-spiffe requires and
+	// as Kubernetes writes it.
+	CredentialBundlePath string
 
 	// TrustDomain is the domain the anchors in BundlePath vouch for.
 	// Required: a PEM file is a bare list of certificates and says
@@ -174,24 +174,9 @@ type SPIFFEFileOptions struct {
 // returned Certificates or PrivateKey fields is a data race. Treat both
 // as immutable.
 type SPIFFEFileSource struct {
-	opts  SPIFFEFileOptions
-	state atomic.Pointer[fileCredentials]
-
-	// errs queues reload failures for the single goroutine that runs
-	// OnError. Nil when the caller supplied no callback.
-	errs      chan error
-	stop      chan struct{}
-	closeOnce sync.Once
-	done      chan struct{}
+	opts   SPIFFEFileOptions
+	reload *filereload.Reloader[fileCredentials]
 }
-
-// errQueueDepth is how many reload failures may be waiting on OnError
-// before further ones are dropped.
-//
-// Deep enough that an ordinarily slow callback loses nothing at a 30s
-// tick, shallow enough to stay a constant. What it buys is a bound: the
-// queue, not the goroutine count, is what grows when a callback wedges.
-const errQueueDepth = 8
 
 // fileCredentials is one consistent read of all three files. It is
 // swapped in whole, so a caller never sees an SVID from one generation
@@ -231,11 +216,11 @@ func GKEFileOptions(trustDomain spiffeid.TrustDomain) SPIFFEFileOptions {
 // a server whose credentials are missing or malformed should not reach
 // the point of listening. Call Close to stop the reloader.
 func NewSPIFFEFileSource(opts SPIFFEFileOptions) (*SPIFFEFileSource, error) {
+	if err := validateCredentialPaths("SPIFFEFileOptions", opts.CredentialBundlePath,
+		opts.CertPath, opts.KeyPath); err != nil {
+		return nil, err
+	}
 	switch {
-	case opts.CertPath == "":
-		return nil, errors.New("purser/mtls: SPIFFEFileOptions: CertPath is required")
-	case opts.KeyPath == "":
-		return nil, errors.New("purser/mtls: SPIFFEFileOptions: KeyPath is required")
 	case opts.BundlePath == "":
 		return nil, errors.New("purser/mtls: SPIFFEFileOptions: BundlePath is required")
 	case opts.TrustDomain.IsZero():
@@ -243,30 +228,12 @@ func NewSPIFFEFileSource(opts SPIFFEFileOptions) (*SPIFFEFileSource, error) {
 			"a PEM bundle does not say which trust domain its anchors vouch for")
 	}
 
-	s := &SPIFFEFileSource{
-		opts: opts,
-		stop: make(chan struct{}),
-		done: make(chan struct{}),
-	}
-	creds, err := s.load()
+	s := &SPIFFEFileSource{opts: opts}
+	r, err := filereload.Start(s.load, opts.ReloadInterval, opts.OnError)
 	if err != nil {
 		return nil, err
 	}
-	s.state.Store(creds)
-
-	if opts.ReloadInterval < 0 {
-		close(s.done)
-		return s, nil
-	}
-	interval := opts.ReloadInterval
-	if interval == 0 {
-		interval = defaultReloadInterval
-	}
-	if opts.OnError != nil {
-		s.errs = make(chan error, errQueueDepth)
-		go s.reportLoop()
-	}
-	go s.reloadLoop(interval)
+	s.reload = r
 	return s, nil
 }
 
@@ -290,7 +257,7 @@ func (s *SPIFFEFileSource) GetX509SVID() (*x509svid.SVID, error) {
 	if notAfter := creds.svid.Certificates[0].NotAfter; time.Now().After(notAfter) {
 		return nil, fmt.Errorf("purser/mtls: SPIFFEFileSource: the SVID for %q expired at %s and "+
 			"has not been replaced; check %q and the OnError callback",
-			creds.svid.ID, notAfter.UTC().Format(time.RFC3339), s.opts.CertPath)
+			creds.svid.ID, notAfter.UTC().Format(time.RFC3339), s.certSource())
 	}
 	return creds.svid, nil
 }
@@ -300,36 +267,30 @@ func (s *SPIFFEFileSource) current() (*fileCredentials, error) {
 	if s == nil {
 		return nil, errors.New("purser/mtls: SPIFFEFileSource is nil")
 	}
-	if s.isClosed() {
+	creds, err := s.reload.Current()
+	switch {
+	case errors.Is(err, filereload.ErrClosed):
 		// Matching workloadapi.X509Source, which reports every read
 		// after Close rather than serving a credential it has stopped
 		// refreshing. A caller who closed the source but left the
 		// tls.Config alive — `defer src.Close()` in a function that
 		// returns the config — should find out now, not at expiry.
 		return nil, errors.New("purser/mtls: SPIFFEFileSource is closed")
-	}
-	creds := s.state.Load()
-	if creds == nil {
-		// Unreachable via NewSPIFFEFileSource, which stores a
-		// credential before returning. Reached only by a zero value.
+	case err != nil:
+		// Reached only by a zero value: NewSPIFFEFileSource stores a
+		// credential before returning.
 		return nil, errors.New("purser/mtls: SPIFFEFileSource has loaded no credential; " +
 			"it must come from NewSPIFFEFileSource")
 	}
 	return creds, nil
 }
 
-// isClosed reports whether Close has been called. A zero value has a nil
-// stop channel and is not closed — it never started.
-func (s *SPIFFEFileSource) isClosed() bool {
-	if s.stop == nil {
-		return false
+// certSource names the file the SVID chain comes from, for messages.
+func (s *SPIFFEFileSource) certSource() string {
+	if s.opts.CredentialBundlePath != "" {
+		return s.opts.CredentialBundlePath
 	}
-	select {
-	case <-s.stop:
-		return true
-	default:
-		return false
-	}
+	return s.opts.CertPath
 }
 
 // GetX509BundleForTrustDomain returns the most recently loaded anchors
@@ -378,88 +339,10 @@ func (s *SPIFFEFileSource) GetX509BundleForTrustDomain(trustDomain spiffeid.Trus
 // wedged is not going to shut down cleanly regardless. Callers who must
 // bound shutdown should give Close its own goroutine and move on.
 func (s *SPIFFEFileSource) Close() error {
-	if s == nil || s.stop == nil {
-		// A zero value never started a goroutine, and close(nil) would
-		// panic. The getters already fail closed for this case; Close
-		// should not be the one method that punishes it.
+	if s == nil {
 		return nil
 	}
-	s.closeOnce.Do(func() { close(s.stop) })
-	<-s.done
-	return nil
-}
-
-// reloadLoop re-reads the files until Close.
-func (s *SPIFFEFileSource) reloadLoop(interval time.Duration) {
-	defer close(s.done)
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-s.stop:
-			return
-		case <-ticker.C:
-			creds, err := s.load()
-			if err != nil {
-				// Keep the last good credential. See the type comment:
-				// a stale SVID may still be valid, and GetX509SVID
-				// refuses to serve it once it is not.
-				s.reportError(err)
-				continue
-			}
-			s.state.Store(creds)
-		}
-	}
-}
-
-// reportError queues err for the OnError goroutine, dropping it if that
-// goroutine is behind.
-//
-// Delivery is off the reload loop because calling OnError inline would
-// put caller-supplied code on that loop's critical path, where three
-// ordinary things become severe: a callback that blocks stops all future
-// reloads, so the SVID quietly ages out to expiry even after the files
-// recover; a callback that calls Close deadlocks outright, since Close
-// waits for the loop that is waiting for the callback; and a panic takes
-// down the process from a goroutine the caller never started and cannot
-// recover on.
-//
-// The send is non-blocking so that the reload loop is not merely off the
-// callback's critical path but independent of it.
-func (s *SPIFFEFileSource) reportError(err error) {
-	if s.errs == nil {
-		return
-	}
-	select {
-	case s.errs <- err:
-	default:
-		// The callback is more than errQueueDepth behind. See the
-		// OnError field comment: the errors being dropped here all say
-		// the same thing as the one already queued ahead of them.
-	}
-}
-
-// reportLoop runs OnError, one call at a time, until Close.
-//
-// One long-lived goroutine rather than one per failure: a callback that
-// blocks should cost a bounded queue, not an unbounded pile of
-// goroutines for as long as the mount stays unreadable.
-func (s *SPIFFEFileSource) reportLoop() {
-	for {
-		select {
-		case <-s.stop:
-			return
-		case err := <-s.errs:
-			s.deliver(err)
-		}
-	}
-}
-
-// deliver calls OnError with a panic in it recovered, so that a callback
-// cannot take the process down from a goroutine its author never started.
-func (s *SPIFFEFileSource) deliver(err error) {
-	defer func() { _ = recover() }()
-	s.opts.OnError(err)
+	return s.reload.Close()
 }
 
 // load reads and validates one generation of all three files.
@@ -479,6 +362,10 @@ func (s *SPIFFEFileSource) load() (*fileCredentials, error) {
 
 	svid, err := x509svid.Parse(certPEM, keyPEM)
 	if err != nil {
+		if s.opts.CredentialBundlePath != "" {
+			return nil, fmt.Errorf("purser/mtls: load X509-SVID from %q: %w",
+				s.opts.CredentialBundlePath, err)
+		}
 		return nil, fmt.Errorf("purser/mtls: load X509-SVID from %q and %q: %w",
 			s.opts.CertPath, s.opts.KeyPath, err)
 	}
@@ -502,36 +389,38 @@ func (s *SPIFFEFileSource) load() (*fileCredentials, error) {
 	return &fileCredentials{svid: svid, bundle: bundle}, nil
 }
 
-// readAll reads the three files twice and returns their contents only if
-// both reads agree. See load for why.
+// readAll reads the credential and bundle files twice, and returns
+// their contents only if both reads agree. See filereload.ReadStable.
 func (s *SPIFFEFileSource) readAll() (certPEM, keyPEM, bundlePEM []byte, err error) {
-	read := func() (c, k, b []byte, err error) {
-		if c, err = os.ReadFile(s.opts.CertPath); err != nil {
-			return nil, nil, nil, fmt.Errorf("purser/mtls: read SVID chain: %w", err)
-		}
-		if k, err = os.ReadFile(s.opts.KeyPath); err != nil {
-			return nil, nil, nil, fmt.Errorf("purser/mtls: read SVID key: %w", err)
-		}
-		if b, err = os.ReadFile(s.opts.BundlePath); err != nil {
-			return nil, nil, nil, fmt.Errorf("purser/mtls: read trust bundle: %w", err)
-		}
-		return c, k, b, nil
+	files := []filereload.File{
+		{Path: s.opts.CertPath, What: "SVID chain"},
+		{Path: s.opts.KeyPath, What: "SVID key"},
+		{Path: s.opts.BundlePath, What: "trust bundle"},
 	}
-
-	certPEM, keyPEM, bundlePEM, err = read()
+	if s.opts.CredentialBundlePath != "" {
+		files = []filereload.File{
+			{Path: s.opts.CredentialBundlePath, What: "SVID credential bundle"},
+			{Path: s.opts.BundlePath, What: "trust bundle"},
+		}
+	}
+	got, err := filereload.ReadStable(files...)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, fmt.Errorf("purser/mtls: %w", err)
 	}
-	certAgain, keyAgain, bundleAgain, err := read()
+	if s.opts.CredentialBundlePath == "" {
+		return got[0], got[1], got[2], nil
+	}
+	certPEM, keyPEM, keyType, err := splitCredentialBundle(got[0])
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, fmt.Errorf("purser/mtls: SVID credential bundle at %q: %w",
+			s.opts.CredentialBundlePath, err)
 	}
-	if !bytes.Equal(certPEM, certAgain) ||
-		!bytes.Equal(keyPEM, keyAgain) ||
-		!bytes.Equal(bundlePEM, bundleAgain) {
-		return nil, nil, nil, fmt.Errorf("purser/mtls: credentials under %q changed while being "+
-			"read, so this generation may be torn; retrying on the next reload",
-			filepath.Dir(s.opts.CertPath))
+	if keyType != "PRIVATE KEY" {
+		// go-spiffe parses only PKCS#8 and skips other key blocks
+		// silently, which surfaces as a baffling "no private key found".
+		return nil, nil, nil, fmt.Errorf("purser/mtls: SVID credential bundle at %q holds a %q "+
+			"block; the SPIFFE profile needs a PKCS#8 \"PRIVATE KEY\"",
+			s.opts.CredentialBundlePath, keyType)
 	}
-	return certPEM, keyPEM, bundlePEM, nil
+	return certPEM, keyPEM, got[1], nil
 }
