@@ -77,8 +77,9 @@
 // The config is yours to adjust — a ClientSessionCache, a KeyLogWriter,
 // a tighter CipherSuites list — but two fields are load-bearing and
 // overwriting them removes the verification the constructor installed:
-// VerifyConnection, and (for SPIFFE) InsecureSkipVerify, which must
-// stay true for the reason given above.
+// VerifyConnection, and InsecureSkipVerify where the constructor set it
+// (the SPIFFE profile, and the PKI profile with RootCAsSource), which
+// must stay true for the reason given above.
 //
 // # Encrypted Client Hello needs nothing here, and that is worth saying
 //
@@ -86,7 +87,8 @@
 // sets EncryptedClientHelloConfigList and the server rejects ECH, both
 // VerifyPeerCertificate and VerifyConnection are guarded by
 // !echRejected, and the chain is verified against RootCAs instead —
-// nil under the SPIFFE profile, meaning the system roots. That reads
+// nil under the SPIFFE profile and under PKIOptions.RootCAsSource,
+// meaning the system roots. That reads
 // like the resumption trap above and invites the same fix, an
 // EncryptedClientHelloRejectionVerify hook. It is not, and the hook is
 // a mistake, for two independent reasons.
@@ -114,6 +116,11 @@
 package client
 
 import (
+	"crypto/ecdsa"
+	"crypto/ed25519"
+	"crypto/elliptic"
+	"crypto/fips140"
+	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
@@ -168,6 +175,17 @@ type PKIOptions struct {
 	// crypto/tls sent in SNI — which net/http sets to the dialed host.
 	// Dialing an IP address with no ServerName is refused rather than
 	// verified, since SNI cannot carry an IP; set ServerName.
+	//
+	// Three differences from RootCAs are worth knowing.
+	// ConnectionState.VerifiedChains is empty, because crypto/tls did
+	// not build the chain; the leaf is PeerCertificates[0].
+	// Config.Time is not consulted; verification uses the current
+	// time. And with a ClientSessionCache, the first resumption of a
+	// session cached before a rotation fails, rather than being
+	// skipped as crypto/tls skips one whose chain no longer verifies
+	// against RootCAs. The failed session is evicted, so the next dial
+	// makes a full handshake, but net/http does not retry, so one
+	// request per cached session fails. No cache is set by default.
 	RootCAsSource RootCAsSource
 
 	// ServerName is the name verified against the server certificate,
@@ -179,7 +197,7 @@ type PKIOptions struct {
 
 	// Admit is the optional check applied to the server's verified
 	// leaf, the mirror of mtls.PKIOptions.Admit. Nil admits any server
-	// whose chain reaches RootCAs.
+	// whose chain reaches RootCAs (or RootCAsSource's pool).
 	//
 	// Worth setting when the pool holds a CA that issues broadly: chain
 	// verification alone then proves only that the peer holds some
@@ -332,9 +350,14 @@ func verifyWithSource(src RootCAsSource, serverName string, admit mtls.CertMatch
 		if len(cs.PeerCertificates) == 0 {
 			return errors.New("purser/client: server presented no certificate")
 		}
-		name := serverName
+		// The name crypto/tls sent, so a caller who clones the config
+		// and changes ServerName has that name verified, as crypto/tls
+		// itself would. It is empty only for an IP: SNI cannot carry
+		// one, and then the ServerName given to NewPKI, if any, is the
+		// name to check (an IP there matches IP SANs).
+		name := cs.ServerName
 		if name == "" {
-			name = cs.ServerName
+			name = serverName
 		}
 		if name == "" {
 			// crypto/tls would have verified an IP SAN here, from the
@@ -364,12 +387,57 @@ func verifyWithSource(src RootCAsSource, serverName string, admit mtls.CertMatch
 		if err != nil {
 			return fmt.Errorf("purser/client: server certificate did not verify: %w", err)
 		}
+		if chains, err = fipsAllowedChains(chains); err != nil {
+			return fmt.Errorf("purser/client: %w", err)
+		}
 		if admit != nil {
 			if err := admit(chains[0][0]); err != nil {
 				return fmt.Errorf("purser/client: server not admitted: %w", err)
 			}
 		}
 		return nil
+	}
+}
+
+// fipsAllowedChains drops chains holding a key FIPS 140 mode does not
+// permit, and fails when none is left. It is crypto/tls's own filter
+// (fipsAllowedChains in common.go), which verifyServerCertificate
+// applies and which a config verifying in VerifyConnection would
+// otherwise skip. Outside FIPS mode it is the identity.
+func fipsAllowedChains(chains [][]*x509.Certificate) ([][]*x509.Certificate, error) {
+	if !fips140.Enabled() {
+		return chains, nil
+	}
+	return filterFIPSChains(chains)
+}
+
+// filterFIPSChains is fipsAllowedChains with FIPS mode taken as on.
+func filterFIPSChains(chains [][]*x509.Certificate) ([][]*x509.Certificate, error) {
+	var permitted [][]*x509.Certificate
+	for _, chain := range chains {
+		if len(chain) > 0 && !slices.ContainsFunc(chain, func(c *x509.Certificate) bool {
+			return !certificateAllowedFIPS(c)
+		}) {
+			permitted = append(permitted, chain)
+		}
+	}
+	if len(permitted) == 0 {
+		return nil, errors.New("no FIPS-compatible server certificate chain")
+	}
+	return permitted, nil
+}
+
+// certificateAllowedFIPS mirrors crypto/tls's isCertificateAllowedFIPS.
+func certificateAllowedFIPS(c *x509.Certificate) bool {
+	switch k := c.PublicKey.(type) {
+	case *rsa.PublicKey:
+		return k.N.BitLen() >= 2048
+	case *ecdsa.PublicKey:
+		return k.Curve == elliptic.P256() || k.Curve == elliptic.P384() || k.Curve == elliptic.P521()
+	case ed25519.PublicKey:
+		return true
+	default:
+		return false
 	}
 }
 

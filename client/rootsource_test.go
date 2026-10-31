@@ -19,6 +19,7 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -253,6 +254,137 @@ func TestPKIRootCAsSourceVerifiesResumedSessions(t *testing.T) {
 	roots.set(other.Pool(), nil)
 	if _, err := dialTLS(t, addr, cfg); err == nil {
 		t.Fatal("a resumed session was accepted after its server's authority left the pool")
+	}
+}
+
+// TestPKIRootCAsSourceVerifiesTheNameSent covers the SNI path: with no
+// ServerName the dialed host is verified, and a caller who clones the
+// config and changes ServerName has the new name verified, as crypto/tls
+// itself would.
+func TestPKIRootCAsSourceVerifiesTheNameSent(t *testing.T) {
+	t.Parallel()
+	serviceDNS := authtest.NewCA(t, "servicedns")
+	podIdentity := authtest.NewCA(t, "podidentity")
+	addr := newDNSNamedServer(t, serviceDNS, podIdentity, "localhost")
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert := podIdentity.IssueClient(t, "lookout")
+	roots := &swappableRoots{pool: serviceDNS.Pool()}
+
+	t.Run("dialed host, no ServerName", func(t *testing.T) {
+		cfg, err := client.NewPKI(client.PKIOptions{Certificate: &cert, RootCAsSource: roots})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := dialTLS(t, net.JoinHostPort("localhost", port), cfg); err != nil {
+			t.Fatalf("dial localhost with a localhost certificate: %v", err)
+		}
+	})
+	t.Run("ServerName changed on a clone", func(t *testing.T) {
+		cfg, err := client.NewPKI(client.PKIOptions{
+			Certificate: &cert, RootCAsSource: roots, ServerName: "atenet-router.ate-system.svc",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := dialTLS(t, addr, cfg); err == nil {
+			t.Fatal("a localhost certificate was accepted as atenet-router's")
+		}
+		clone := cfg.Clone()
+		clone.ServerName = "localhost"
+		if _, err := dialTLS(t, addr, clone); err != nil {
+			t.Fatalf("the clone's ServerName was not the one verified: %v", err)
+		}
+	})
+}
+
+func TestPKIRootCAsSourceAcceptsAnIPServerName(t *testing.T) {
+	t.Parallel()
+	serviceDNS := authtest.NewCA(t, "servicedns")
+	podIdentity := authtest.NewCA(t, "podidentity")
+	serverCert := serviceDNS.IssueServer(t, "127.0.0.1") // an IP SAN
+	srv, _, err := mtls.NewPKI(mtls.PKIOptions{
+		Certificate: &serverCert, ClientCAs: podIdentity.Pool(), Subject: mtls.SubjectCommonName,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := serveTLS(t, srv)
+	cert := podIdentity.IssueClient(t, "lookout")
+	cfg, err := client.NewPKI(client.PKIOptions{
+		Certificate: &cert, RootCAsSource: &swappableRoots{pool: serviceDNS.Pool()}, ServerName: "127.0.0.1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dialTLS(t, addr, cfg); err != nil {
+		t.Fatalf("an IP ServerName did not match the IP SAN: %v", err)
+	}
+}
+
+func TestPKIRootCAsSourceRequiresServerAuth(t *testing.T) {
+	t.Parallel()
+	serviceDNS := authtest.NewCA(t, "servicedns")
+	podIdentity := authtest.NewCA(t, "podidentity")
+	const name = "atenet-router.ate-system.svc"
+	serverCert := serviceDNS.Issue(t, authtest.LeafOptions{
+		CommonName: name, DNSSANs: []string{name},
+		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, // client-only
+	})
+	srv, _, err := mtls.NewPKI(mtls.PKIOptions{
+		Certificate: &serverCert, ClientCAs: podIdentity.Pool(), Subject: mtls.SubjectCommonName,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := serveTLS(t, srv)
+	cert := podIdentity.IssueClient(t, "lookout")
+	cfg, err := client.NewPKI(client.PKIOptions{
+		Certificate: &cert, RootCAsSource: &swappableRoots{pool: serviceDNS.Pool()}, ServerName: name,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dialTLS(t, addr, cfg); err == nil {
+		t.Fatal("a server certificate without the serverAuth usage was accepted")
+	}
+}
+
+// TestPKIRootCAsSourceSessionCacheAcrossRotation pins the documented
+// difference from RootCAs: a session cached before a rotation fails its
+// first resumption and is evicted, so the next dial is a full handshake.
+func TestPKIRootCAsSourceSessionCacheAcrossRotation(t *testing.T) {
+	t.Parallel()
+	oldCA := authtest.NewCA(t, "servicedns-old")
+	newCA := authtest.NewCA(t, "servicedns-new")
+	podIdentity := authtest.NewCA(t, "podidentity")
+	const name = "atenet-router.ate-system.svc"
+	addr := newDNSNamedServer(t, oldCA, podIdentity, name)
+	cert := podIdentity.IssueClient(t, "lookout")
+
+	roots := &swappableRoots{pool: oldCA.Pool()}
+	cfg, err := client.NewPKI(client.PKIOptions{Certificate: &cert, RootCAsSource: roots, ServerName: name})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.ClientSessionCache = tls.NewLRUClientSessionCache(4)
+	establishResumption(t, addr, cfg)
+
+	roots.set(newCA.Pool(), nil)
+	if _, err := dialTLS(t, addr, cfg); err == nil {
+		t.Fatal("the stale session resumed although its authority left the pool")
+	}
+	// The pool goes back to trusting the server: the next dial must be
+	// a full handshake, because the failed session was evicted.
+	roots.set(oldCA.Pool(), nil)
+	state, err := dialTLS(t, addr, cfg)
+	if err != nil {
+		t.Fatalf("dial after eviction: %v", err)
+	}
+	if state.DidResume {
+		t.Error("the session that failed verification was resumed again; it should have been evicted")
 	}
 }
 

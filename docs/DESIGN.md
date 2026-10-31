@@ -1037,12 +1037,24 @@ a pool that changes cannot be expressed through it. `PKIOptions.RootCAsSource`
 (satisfied by `mtls.CertPoolFileSource`) takes its place: the
 constructor sets `InsecureSkipVerify` and `VerifyConnection` does what
 `crypto/tls` would have done against the pool current at that handshake —
-chain to a root, `serverAuth`, and the server name. The name is
-`ServerName`, else the SNI `crypto/tls` sent; dialing an IP with neither
-is refused, since an IP cannot travel in SNI and the dialed address is
-not visible from the hook. Because the hook is `VerifyConnection`, a
-resumed session is checked against today's pool too. This is the same
-structure as the SPIFFE profile below, for the same reason.
+chain to a root, `serverAuth`, the server name, and in FIPS 140 mode
+`crypto/tls`'s own key filter on the chain. The name is the one
+`crypto/tls` sent in SNI, so a caller who clones the config and changes
+`ServerName` has that name verified; for an IP, which SNI cannot carry,
+it is the `ServerName` given to `NewPKI`, and an IP dial with neither is
+refused, since the dialed address is not visible from the hook. Because
+the hook is `VerifyConnection`, a resumed session is checked against
+today's pool too. This is the same structure as the SPIFFE profile
+below, for the same reason.
+
+Three differences from `RootCAs` are documented on the field rather than
+engineered away: `VerifiedChains` is empty; `Config.Time` is not
+consulted; and with a caller-supplied `ClientSessionCache`, a session
+cached before a rotation fails its first resumption instead of being
+skipped. `crypto/tls` re-checks a cached chain against `RootCAs` in
+`loadSession`, but only inside `!InsecureSkipVerify`. The failed session
+is evicted, so the cost is one failed request per cached session per
+rotation, and only for a caller who opted in to a cache.
 
 **The client verifies where the server verifies.** This design
 originally said to return `tlsconfig.MTLSClientConfig(svid, bundle,

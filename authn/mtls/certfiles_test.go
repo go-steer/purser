@@ -16,8 +16,10 @@ package mtls_test
 
 import (
 	"bytes"
+	"crypto/ecdsa"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/pem"
 	"os"
 	"path/filepath"
 	"strings"
@@ -272,6 +274,9 @@ func TestCertificateFileSourceRejectsBadInput(t *testing.T) {
 		{"bundle with two keys", mtls.CertificateFileOptions{
 			CredentialBundlePath: bundle("twokeys.pem", append(append(keyPEM, otherKeyPEM...), certPEM...)),
 		}, "found 2 private keys"},
+		{"bundle that is not PEM", mtls.CertificateFileOptions{
+			CredentialBundlePath: bundle("notpem.pem", []byte("garbage")),
+		}, "found no PEM block"},
 		{"bundle without a certificate", mtls.CertificateFileOptions{
 			CredentialBundlePath: bundle("nocert.pem", keyPEM),
 		}, "no CERTIFICATE block"},
@@ -425,7 +430,8 @@ func TestCertPoolFileSourceRejectsBadInput(t *testing.T) {
 	}{
 		{name: "no path", wantErr: "Path is required"},
 		{name: "missing", path: filepath.Join(dir, "absent"), wantErr: "read CA bundle"},
-		{name: "empty", content: []byte("\n"), wantErr: "no CERTIFICATE block"},
+		{name: "empty", content: []byte("\n"), wantErr: "found no PEM block"},
+		{name: "not PEM", content: []byte("garbage"), wantErr: "found no PEM block"},
 		{name: "a key", content: keyPEM, wantErr: "want only CERTIFICATE blocks"},
 		{name: "trailing", content: append(authority.CertPEM(), "-----BEGIN"...), wantErr: "trailing data"},
 	} {
@@ -534,4 +540,76 @@ func TestSPIFFEFileSourceReadsAPodCertificateBundle(t *testing.T) {
 	}); err == nil || !strings.Contains(err.Error(), "load X509-SVID from") {
 		t.Errorf("mismatched bundle = %v, want a load error", err)
 	}
+}
+
+func TestCertificateFileSourceExpiryNamesTheChainFile(t *testing.T) {
+	t.Parallel()
+	authority := newCoreCA(t, "expiry-pair")
+	old, err := authority.Issue(ca.LeafOptions{
+		CommonName: "old", NotBefore: time.Now().Add(-2 * time.Hour), NotAfter: time.Now().Add(-time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	certPEM, keyPEM, err := ca.EncodePEM(old)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	certPath, keyPath := filepath.Join(dir, "tls.crt"), filepath.Join(dir, "tls.key")
+	writeFile(t, certPath, certPEM)
+	writeFile(t, keyPath, keyPEM)
+	src, err := mtls.NewCertificateFileSource(mtls.CertificateFileOptions{
+		CertPath: certPath, KeyPath: keyPath, ReloadInterval: -1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = src.Close() }()
+	if _, err := src.GetCertificate(nil); err == nil || !strings.Contains(err.Error(), certPath) {
+		t.Fatalf("GetCertificate = %v, want an expiry error naming %s", err, certPath)
+	}
+}
+
+func TestSPIFFEFileSourceRequiresAPKCS8KeyInABundle(t *testing.T) {
+	t.Parallel()
+	authority := newCoreCA(t, "podidentity")
+	const id = "spiffe://cluster.local/ns/a/sa/b"
+	cert, err := authority.Issue(ca.LeafOptions{URISANs: []string{id}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	certPEM, _, err := ca.EncodePEM(cert)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ecKey, ok := cert.PrivateKey.(*ecdsa.PrivateKey)
+	if !ok {
+		t.Skipf("the test CA issued a %T key; this test needs ECDSA", cert.PrivateKey)
+	}
+	der, err := x509.MarshalECPrivateKey(ecKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	bundlePath := filepath.Join(dir, "credential-bundle.pem")
+	writeFile(t, bundlePath, append(pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: der}), certPEM...))
+	anchors := filepath.Join(dir, "trust-bundle.pem")
+	writeFile(t, anchors, authority.CertPEM())
+
+	_, err = mtls.NewSPIFFEFileSource(mtls.SPIFFEFileOptions{
+		CredentialBundlePath: bundlePath, BundlePath: anchors,
+		TrustDomain: trustDomain(t, "cluster.local"), ReloadInterval: -1,
+	})
+	if err == nil || !strings.Contains(err.Error(), "PKCS#8") {
+		t.Fatalf("EC key bundle = %v, want an error asking for PKCS#8", err)
+	}
+	// The PKI source accepts the same file: tls.X509KeyPair parses SEC 1.
+	src, err := mtls.NewCertificateFileSource(mtls.CertificateFileOptions{
+		CredentialBundlePath: bundlePath, ReloadInterval: -1,
+	})
+	if err != nil {
+		t.Fatalf("CertificateFileSource with an EC key: %v", err)
+	}
+	_ = src.Close()
 }

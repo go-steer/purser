@@ -34,8 +34,8 @@ type CertificateFileOptions struct {
 	// projected volume: one PKCS#8 "PRIVATE KEY" block followed by the
 	// chain. The kubelet rewrites it in place as the certificate
 	// rotates. Exactly one PRIVATE KEY (or EC or RSA PRIVATE KEY) block
-	// and at least one CERTIFICATE block are required, and nothing
-	// else may be in the file.
+	// and at least one CERTIFICATE block are required. Any other block
+	// type, or a partial block at the end, is refused.
 	//
 	// Set either CredentialBundlePath, or CertPath and KeyPath.
 	CredentialBundlePath string
@@ -167,7 +167,7 @@ func (s *CertificateFileSource) load() (*tls.Certificate, error) {
 		if err != nil {
 			return nil, fmt.Errorf("purser/mtls: %w", err)
 		}
-		if certPEM, keyPEM, err = splitCredentialBundle(got[0]); err != nil {
+		if certPEM, keyPEM, _, err = splitCredentialBundle(got[0]); err != nil {
 			return nil, fmt.Errorf("purser/mtls: credential bundle at %q: %w",
 				s.opts.CredentialBundlePath, err)
 		}
@@ -207,8 +207,8 @@ type CertPoolFileOptions struct {
 	// Path is a PEM file of CA certificates: a Kubernetes
 	// clusterTrustBundle projection, a cert-manager ca.crt, or any
 	// bundle a platform rewrites in place when an authority rotates.
-	// Required. It must hold at least one CERTIFICATE block and
-	// nothing else.
+	// Required. It must hold at least one CERTIFICATE block, no other
+	// block types, and no partial block at the end.
 	Path string
 
 	// ReloadInterval is how often the file is re-read. Zero means 30
@@ -327,14 +327,16 @@ func isPrivateKeyBlock(blockType string) bool {
 
 // splitCredentialBundle separates a podCertificate credential bundle
 // into its certificate chain and its private key, each re-encoded as
-// PEM.
+// PEM, and reports the key's block type.
 //
 // It is strict on purpose. Exactly one key and at least one
 // certificate, no other block types, and nothing after the last
 // complete block: encoding/pem stops quietly at a partial block, so
 // trailing bytes are how a bundle torn mid-rewrite shows itself, on top
-// of the double read that already guards against one.
-func splitCredentialBundle(data []byte) (certPEM, keyPEM []byte, err error) {
+// of the double read that already guards against one. (Text before a
+// BEGIN line is skipped by encoding/pem and so is not caught; it is
+// not how a torn write looks.)
+func splitCredentialBundle(data []byte) (certPEM, keyPEM []byte, keyType string, err error) {
 	var certs, keys int
 	rest := data
 	for {
@@ -350,22 +352,35 @@ func splitCredentialBundle(data []byte) (certPEM, keyPEM []byte, err error) {
 		case isPrivateKeyBlock(block.Type):
 			keys++
 			keyPEM = pem.EncodeToMemory(block)
+			keyType = block.Type
 		default:
-			return nil, nil, fmt.Errorf("unexpected PEM block %q; a credential bundle holds "+
+			return nil, nil, "", fmt.Errorf("unexpected PEM block %q; a credential bundle holds "+
 				"one private key and its certificate chain", block.Type)
 		}
 	}
-	if len(bytes.TrimSpace(rest)) != 0 {
-		return nil, nil, errors.New("trailing data after the last complete PEM block; " +
-			"the file may be mid-rewrite")
+	if err := checkPEMRest(certs+keys, rest); err != nil {
+		return nil, nil, "", err
 	}
 	switch {
 	case keys != 1:
-		return nil, nil, fmt.Errorf("found %d private keys, want exactly 1", keys)
+		return nil, nil, "", fmt.Errorf("found %d private keys, want exactly 1", keys)
 	case certs == 0:
-		return nil, nil, errors.New("found no CERTIFICATE block")
+		return nil, nil, "", errors.New("found no CERTIFICATE block")
 	}
-	return certPEM, keyPEM, nil
+	return certPEM, keyPEM, keyType, nil
+}
+
+// checkPEMRest reports what encoding/pem left unparsed: nothing at all
+// when no block was found, or a partial block after the last one.
+func checkPEMRest(blocks int, rest []byte) error {
+	switch {
+	case blocks == 0:
+		return errors.New("found no PEM block")
+	case len(bytes.TrimSpace(rest)) != 0:
+		return errors.New("trailing data after the last complete PEM block; " +
+			"the file may be mid-rewrite")
+	}
+	return nil
 }
 
 // pemCertificates parses every block of a PEM file as a certificate,
@@ -389,12 +404,8 @@ func pemCertificates(data []byte) ([]*x509.Certificate, error) {
 		}
 		certs = append(certs, c)
 	}
-	if len(bytes.TrimSpace(rest)) != 0 {
-		return nil, errors.New("trailing data after the last complete PEM block; " +
-			"the file may be mid-rewrite")
-	}
-	if len(certs) == 0 {
-		return nil, errors.New("found no CERTIFICATE block")
+	if err := checkPEMRest(len(certs), rest); err != nil {
+		return nil, err
 	}
 	return certs, nil
 }

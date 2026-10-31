@@ -130,22 +130,48 @@ func TestAFailedReloadKeepsTheLastValueAndReports(t *testing.T) {
 	}
 }
 
-func TestErrorCallbackMayBlockPanicAndClose(t *testing.T) {
+func TestErrorCallbackMayBlockAndPanic(t *testing.T) {
 	t.Parallel()
 	c := &counter{}
-	c.fail.Store(false)
-	var r *Reloader[int64]
 	release := make(chan struct{})
 	var calls atomic.Int64
 	onError := func(error) {
-		switch calls.Add(1) {
-		case 1:
+		if calls.Add(1) == 1 {
 			panic("a callback that panics must not take the process down")
-		case 2:
-			<-release // blocks while more errors are dropped
-		default:
-			_ = r.Close() // calling Close from the callback must not deadlock
 		}
+		<-release // every later call blocks
+	}
+	var attempts atomic.Int64
+	load := func() (*int64, error) { attempts.Add(1); return c.load() }
+	r, err := Start(load, time.Millisecond, onError)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer func() { close(release); _ = r.Close() }()
+
+	c.fail.Store(true)
+	waitFor(t, "the callback to block", func() bool { return calls.Load() >= 2 })
+	// The reload loop keeps loading while the callback is blocked:
+	// delivery is off its path.
+	before := attempts.Load()
+	waitFor(t, "reloads to continue while the callback blocks", func() bool {
+		return attempts.Load() > before+3
+	})
+}
+
+func TestCloseFromTheErrorCallbackReturns(t *testing.T) {
+	t.Parallel()
+	c := &counter{}
+	var r *Reloader[int64]
+	closed := make(chan struct{})
+	var once sync.Once
+	onError := func(error) {
+		once.Do(func() {
+			// Close from inside the callback must return: it waits for
+			// the reload loop, which must not be waiting for us.
+			_ = r.Close()
+			close(closed)
+		})
 	}
 	var err error
 	r, err = Start(c.load, time.Millisecond, onError)
@@ -153,14 +179,11 @@ func TestErrorCallbackMayBlockPanicAndClose(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 	c.fail.Store(true)
-	waitFor(t, "the blocking callback", func() bool { return calls.Load() >= 2 })
-	// The reload loop keeps running while the callback blocks.
-	time.Sleep(20 * time.Millisecond)
-	close(release)
-	waitFor(t, "Close from the callback", func() bool {
-		_, err := r.Current()
-		return errors.Is(err, ErrClosed)
-	})
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close called from the error callback did not return")
+	}
 }
 
 func TestCloseIsIdempotentAndConcurrent(t *testing.T) {

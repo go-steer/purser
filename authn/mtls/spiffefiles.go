@@ -63,7 +63,9 @@ type SPIFFEFileOptions struct {
 	// a Kubernetes podCertificate projected volume, as Agent
 	// Substrate's podidentity signer issues. It replaces CertPath and
 	// KeyPath and is mutually exclusive with them. See
-	// CertificateFileOptions.CredentialBundlePath for the format.
+	// CertificateFileOptions.CredentialBundlePath for the format; here
+	// the key must be PKCS#8 ("PRIVATE KEY"), as go-spiffe requires and
+	// as Kubernetes writes it.
 	CredentialBundlePath string
 
 	// TrustDomain is the domain the anchors in BundlePath vouch for.
@@ -408,10 +410,17 @@ func (s *SPIFFEFileSource) readAll() (certPEM, keyPEM, bundlePEM []byte, err err
 	if s.opts.CredentialBundlePath == "" {
 		return got[0], got[1], got[2], nil
 	}
-	certPEM, keyPEM, err = splitCredentialBundle(got[0])
+	certPEM, keyPEM, keyType, err := splitCredentialBundle(got[0])
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("purser/mtls: SVID credential bundle at %q: %w",
 			s.opts.CredentialBundlePath, err)
+	}
+	if keyType != "PRIVATE KEY" {
+		// go-spiffe parses only PKCS#8 and skips other key blocks
+		// silently, which surfaces as a baffling "no private key found".
+		return nil, nil, nil, fmt.Errorf("purser/mtls: SVID credential bundle at %q holds a %q "+
+			"block; the SPIFFE profile needs a PKCS#8 \"PRIVATE KEY\"",
+			s.opts.CredentialBundlePath, keyType)
 	}
 	return certPEM, keyPEM, got[1], nil
 }
