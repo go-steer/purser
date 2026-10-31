@@ -38,6 +38,10 @@ github.com/go-steer/purser/authz                  97.0  # 98.4
 github.com/go-steer/purser/client                 97.0  # 98.3
 github.com/go-steer/purser/httpmw                 98.0  # 98.9
 
+# The reload loop behind every file-backed source. Short of 100 for the
+# arms a test cannot provoke without racing the ticker.
+github.com/go-steer/purser/internal/filereload    96.0  # 97.2
+
 # Test support. authtest is held to the same standard as the code it exercises
 # — a conformance suite that is itself untested reports what it was written to
 # report. Its uncovered remainder is the panic-on-misuse arms.

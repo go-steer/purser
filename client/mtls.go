@@ -144,7 +144,7 @@ type PKIOptions struct {
 	GetClientCertificate func(*tls.CertificateRequestInfo) (*tls.Certificate, error)
 
 	// RootCAs is the pool of authorities the server's certificate must
-	// chain to. Required.
+	// chain to. Exactly one of RootCAs and RootCAsSource is required.
 	//
 	// Nil is not taken to mean the system roots. A service-to-service
 	// client talks to an internal CA, and the two spellings of nil —
@@ -153,6 +153,22 @@ type PKIOptions struct {
 	// every CA a browser would. A deployment that really does want the
 	// system pool passes x509.SystemCertPool.
 	RootCAs *x509.CertPool
+	// RootCAsSource supplies the pool per handshake instead, for
+	// authorities that rotate in place — a Kubernetes
+	// clusterTrustBundle projection, say, read by
+	// mtls.NewCertPoolFileSource. Exactly one of RootCAs and
+	// RootCAsSource is required.
+	//
+	// crypto/tls reads RootCAs once per config, so a rotating pool
+	// cannot be expressed through it. With a source, the constructor
+	// switches crypto/tls's own chain check off and VerifyConnection
+	// does the same verification against the pool current at that
+	// handshake: the chain to a root, the serverAuth usage, and the
+	// server name. The name is ServerName when set, otherwise the name
+	// crypto/tls sent in SNI — which net/http sets to the dialed host.
+	// Dialing an IP address with no ServerName is refused rather than
+	// verified, since SNI cannot carry an IP; set ServerName.
+	RootCAsSource RootCAsSource
 
 	// ServerName is the name verified against the server certificate,
 	// and sent as SNI. Empty leaves crypto/tls to use the dialed host,
@@ -178,6 +194,15 @@ type PKIOptions struct {
 	// NextProtos is the ALPN protocol list. Empty leaves crypto/tls to
 	// negotiate.
 	NextProtos []string
+}
+
+// RootCAsSource supplies a pool of trust anchors on demand. It is
+// satisfied by *mtls.CertPoolFileSource.
+//
+// CertPool is called once per handshake and its result is not
+// retained. An error fails the handshake.
+type RootCAsSource interface {
+	CertPool() (*x509.CertPool, error)
 }
 
 // SPIFFEOptions configures NewSPIFFE, the X509-SVID client profile.
@@ -235,10 +260,14 @@ func NewPKI(opts PKIOptions) (*tls.Config, error) {
 		return nil, errors.New("purser/client: PKIOptions: Certificate and " +
 			"GetClientCertificate are mutually exclusive")
 	}
-	if opts.RootCAs == nil {
-		return nil, errors.New("purser/client: PKIOptions: RootCAs is required; " +
+	switch {
+	case opts.RootCAs == nil && opts.RootCAsSource == nil:
+		return nil, errors.New("purser/client: PKIOptions: RootCAs is required, or RootCAsSource; " +
 			"nil is not taken to mean the system pool, which for an internal service " +
 			"would trust every CA a browser does")
+	case opts.RootCAs != nil && opts.RootCAsSource != nil:
+		return nil, errors.New("purser/client: PKIOptions: RootCAs and RootCAsSource are " +
+			"mutually exclusive")
 	}
 	minVersion, err := tlsfloor.Resolve(opts.MinVersion)
 	if err != nil {
@@ -262,6 +291,16 @@ func NewPKI(opts PKIOptions) (*tls.Config, error) {
 	} else {
 		cfg.GetClientCertificate = opts.GetClientCertificate
 	}
+	if opts.RootCAsSource != nil {
+		cfg.RootCAs = nil
+		// crypto/tls cannot consult a pool that changes: it reads
+		// RootCAs from the config. Its chain builder is switched off
+		// and VerifyConnection does the same work against the current
+		// pool, on every handshake including a resumed one.
+		cfg.InsecureSkipVerify = true //nolint:gosec // verified in VerifyConnection below
+		cfg.VerifyConnection = verifyWithSource(opts.RootCAsSource, opts.ServerName, opts.Admit)
+		return cfg, nil
+	}
 	if opts.Admit != nil {
 		admit := opts.Admit
 		// VerifyConnection, not VerifyPeerCertificate: see the package
@@ -283,6 +322,55 @@ func NewPKI(opts PKIOptions) (*tls.Config, error) {
 		cfg.VerifyConnection = verify
 	}
 	return cfg, nil
+}
+
+// verifyWithSource is NewPKI's server verification when the roots come
+// from a RootCAsSource: what crypto/tls does with a static RootCAs, done
+// against the pool the source holds now.
+func verifyWithSource(src RootCAsSource, serverName string, admit mtls.CertMatcher) func(tls.ConnectionState) error {
+	return func(cs tls.ConnectionState) error {
+		if len(cs.PeerCertificates) == 0 {
+			return errors.New("purser/client: server presented no certificate")
+		}
+		name := serverName
+		if name == "" {
+			name = cs.ServerName
+		}
+		if name == "" {
+			// crypto/tls would have verified an IP SAN here, from the
+			// dialed address. That address is not visible from this
+			// hook, and verifying nothing in its place is not an
+			// option, so refuse.
+			return errors.New("purser/client: no server name to verify the certificate " +
+				"against; set PKIOptions.ServerName when dialing an IP address")
+		}
+		roots, err := src.CertPool()
+		if err != nil {
+			return fmt.Errorf("purser/client: load trust anchors: %w", err)
+		}
+		if roots == nil {
+			return errors.New("purser/client: RootCAsSource returned no pool")
+		}
+		intermediates := x509.NewCertPool()
+		for _, c := range cs.PeerCertificates[1:] {
+			intermediates.AddCert(c)
+		}
+		chains, err := cs.PeerCertificates[0].Verify(x509.VerifyOptions{
+			Roots:         roots,
+			Intermediates: intermediates,
+			DNSName:       name,
+			KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		})
+		if err != nil {
+			return fmt.Errorf("purser/client: server certificate did not verify: %w", err)
+		}
+		if admit != nil {
+			if err := admit(chains[0][0]); err != nil {
+				return fmt.Errorf("purser/client: server not admitted: %w", err)
+			}
+		}
+		return nil
+	}
 }
 
 // NewSPIFFE returns a client TLS config presenting an X509-SVID and
