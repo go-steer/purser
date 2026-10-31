@@ -12,6 +12,12 @@ in [`CONTRIBUTING.md`](./CONTRIBUTING.md).
 
 ## [Unreleased]
 
+*Nothing yet.*
+
+## [0.5.0] - 2026-10-31
+
+purser can now read Kubernetes pod certificates and follow trust bundles that rotate in place, on the PKI profile as well as SPIFFE. The first user is Agent Substrate's ingress router, which accepts only mTLS from v0.6: its clients present a podidentity pod certificate and verify a DNS-SAN server certificate from a different CA, with `client.PKIOptions.RootCAsSource` re-checking the pool on every handshake. Additive only; this release also builds with Go 1.26.10 for GO-2026-6809.
+
 ### Added
 - `mtls.CertificateFileSource` (`mtls.NewCertificateFileSource`): a
   certificate and key read from files and re-read on an interval, for the
@@ -665,7 +671,8 @@ reported by apidiff, acknowledged in
   and why they verify with opposite `crypto/tls` idioms, the admission /
   identity split, the phase plan, and the verification each phase owes.
 
-[Unreleased]: https://github.com/go-steer/purser/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/go-steer/purser/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/go-steer/purser/releases/tag/v0.5.0
 [0.4.0]: https://github.com/go-steer/purser/releases/tag/v0.4.0
 [0.3.1]: https://github.com/go-steer/purser/releases/tag/v0.3.1
 [0.3.0]: https://github.com/go-steer/purser/releases/tag/v0.3.0
